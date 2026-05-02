@@ -1,0 +1,7 @@
+interface:
+  display_name: "Seedance 视频换角色换场景"
+  short_description: "先剧本化原片和检查源素材，再重制视频"
+  default_prompt: "Use $seedance-role-scene-remake to analyze the source video into a script and reviewable source characters, scenes, props, and voices; inspect analysis/index.html; then prepare target character/scene/voice/language bibles, generate missing target_refs with Seedream 5.0 Lite, approve the manifest, and remake the video with Seedance while preserving story, camera, timing, and dialogue."
+
+policy:
+  allow_implicit_invocation: true

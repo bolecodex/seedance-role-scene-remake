@@ -1,0 +1,25 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Local videos, generated outputs, and resumable job artifacts.
+video/
+job_*/
+final_*.mp4
+final_*.m4a
+*_generated_audio.m4a
+spec_*.yaml
+
+# Temporary media and reports created while validating locally.
+*.mov
+*.avi
+*.mkv
+*.wav
