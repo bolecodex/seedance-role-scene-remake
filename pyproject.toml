@@ -12,6 +12,7 @@ dependencies = [
   "python-dotenv>=1.0.0",
   "tos>=2.7.0",
   "typer>=0.12.3",
+  "websocket-client>=1.8.0",
 ]
 
 [project.optional-dependencies]

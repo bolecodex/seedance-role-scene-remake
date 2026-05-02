@@ -5,12 +5,17 @@ from __future__ import annotations
 import html
 import json
 import shutil
+import gzip
+import struct
+import uuid
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
+import websocket
 
 from seedance_role_scene_remake.config import AppConfig
 from seedance_role_scene_remake.errors import ArkError, PipelineError
@@ -18,9 +23,9 @@ from seedance_role_scene_remake.ffmpeg import (
     detect_scene_timestamps,
     extract_audio_clip,
     extract_audio_for_asr,
-    extract_frame_at,
     get_video_duration,
     image_to_data_url,
+    run_cmd,
 )
 from seedance_role_scene_remake.manifest import Manifest, SourceAnalysisSpec
 
@@ -63,6 +68,141 @@ class ArkASRClient:
         return _json_or_error(response, label="ASR")
 
 
+class DoubaoStreamingASRClient:
+    """Doubao streaming ASR 2.0 WebSocket adapter."""
+
+    PROTOCOL_VERSION = 0b0001
+    DEFAULT_HEADER_SIZE = 0b0001
+    FULL_CLIENT_REQUEST = 0b0001
+    AUDIO_ONLY_REQUEST = 0b0010
+    FULL_SERVER_RESPONSE = 0b1001
+    SERVER_ACK = 0b1011
+    SERVER_ERROR_RESPONSE = 0b1111
+    NO_SEQUENCE = 0b0000
+    POS_SEQUENCE = 0b0001
+    NEG_SEQUENCE = 0b0010
+    NEG_WITH_SEQUENCE = 0b0011
+    JSON_SERIALIZATION = 0b0001
+    GZIP_COMPRESSION = 0b0001
+
+    def __init__(
+        self,
+        *,
+        app_id: str,
+        access_token: str,
+        resource_id: str,
+        ws_url: str,
+        timeout_s: int,
+    ) -> None:
+        self.app_id = app_id
+        self.access_token = access_token
+        self.resource_id = resource_id
+        self.ws_url = ws_url
+        self.timeout_s = timeout_s
+
+    def transcribe(self, audio: Path, *, language: str = "auto", chunk_size: int = 16000) -> dict[str, Any]:
+        if not self.app_id or not self.access_token:
+            raise PipelineError("豆包流式 ASR 需要 SEEDANCE_ROLE_SCENE_DOUBAO_ASR_APP_ID 和 SEEDANCE_ROLE_SCENE_DOUBAO_ASR_ACCESS_TOKEN。")
+        headers = [
+            f"X-Api-App-Key: {self.app_id}",
+            f"X-Api-Access-Key: {self.access_token}",
+            f"X-Api-Resource-Id: {self.resource_id}",
+            f"X-Api-Connect-Id: {uuid.uuid4()}",
+        ]
+        try:
+            ws = websocket.create_connection(self.ws_url, header=headers, timeout=self.timeout_s)
+        except Exception as exc:
+            raise ArkError(f"豆包流式 ASR 连接失败：{exc}") from exc
+        responses: list[dict[str, Any]] = []
+        try:
+            init_payload = {
+                "user": {"uid": "seedance-role-scene-remake"},
+                "audio": {"format": "wav", "codec": "raw", "rate": 16000, "bits": 16, "channel": 1},
+                "request": {
+                    "model_name": "bigmodel",
+                    "enable_itn": True,
+                    "enable_punc": True,
+                    "show_utterances": True,
+                    "result_type": "full",
+                },
+            }
+            if language and language != "auto":
+                init_payload["request"]["language"] = language
+            ws.send_binary(self._client_packet(self.FULL_CLIENT_REQUEST, self.NO_SEQUENCE, json.dumps(init_payload, ensure_ascii=False).encode("utf-8")))
+            self._collect_response(ws, responses)
+
+            data = audio.read_bytes()
+            if not data:
+                raise PipelineError(f"ASR 音频为空：{audio}")
+            chunks = [data[index : index + chunk_size] for index in range(0, len(data), chunk_size)]
+            for index, chunk in enumerate(chunks, start=1):
+                flags = self.NEG_WITH_SEQUENCE if index == len(chunks) else self.POS_SEQUENCE
+                sequence = index + 1
+                ws.send_binary(self._audio_packet(chunk, sequence=-sequence if flags == self.NEG_WITH_SEQUENCE else sequence, flags=flags))
+                self._collect_response(ws, responses)
+        finally:
+            ws.close()
+        return _normalize_doubao_asr_responses(responses)
+
+    def _collect_response(self, ws: Any, responses: list[dict[str, Any]]) -> None:
+        message = ws.recv()
+        parsed = self._parse_response(message)
+        if parsed:
+            responses.append(parsed)
+
+    def _client_packet(self, message_type: int, flags: int, payload: bytes) -> bytes:
+        compressed = gzip.compress(payload)
+        return self._header(message_type, flags) + struct.pack(">I", len(compressed)) + compressed
+
+    def _audio_packet(self, payload: bytes, *, sequence: int, flags: int) -> bytes:
+        compressed = gzip.compress(payload)
+        return self._header(self.AUDIO_ONLY_REQUEST, flags) + struct.pack(">iI", sequence, len(compressed)) + compressed
+
+    def _header(self, message_type: int, flags: int) -> bytes:
+        return bytes(
+            [
+                (self.PROTOCOL_VERSION << 4) | self.DEFAULT_HEADER_SIZE,
+                (message_type << 4) | flags,
+                (self.JSON_SERIALIZATION << 4) | self.GZIP_COMPRESSION,
+                0x00,
+            ]
+        )
+
+    def _parse_response(self, message: bytes | str) -> dict[str, Any]:
+        if isinstance(message, str):
+            try:
+                return json.loads(message)
+            except json.JSONDecodeError:
+                return {"raw": message}
+        if len(message) < 4:
+            return {}
+        header_size = message[0] & 0x0F
+        message_type = message[1] >> 4
+        flags = message[1] & 0x0F
+        compression = message[2] & 0x0F
+        offset = header_size * 4
+        if flags in {self.POS_SEQUENCE, self.NEG_SEQUENCE, self.NEG_WITH_SEQUENCE} and len(message) >= offset + 4:
+            offset += 4
+        if len(message) < offset + 4:
+            return {"message_type": message_type}
+        size = struct.unpack(">I", message[offset : offset + 4])[0]
+        offset += 4
+        payload = message[offset : offset + size]
+        if message_type == self.SERVER_ERROR_RESPONSE:
+            text = payload.decode("utf-8", errors="ignore")
+            raise ArkError(f"豆包流式 ASR 返回错误：{text}")
+        if not payload:
+            return {"message_type": message_type}
+        if compression == self.GZIP_COMPRESSION:
+            payload = gzip.decompress(payload)
+        try:
+            result = json.loads(payload.decode("utf-8"))
+        except json.JSONDecodeError:
+            result = {"payload": payload.decode("utf-8", errors="ignore")}
+        result["message_type"] = message_type
+        return result
+
+
 class ArkVLMClient:
     """Ark OpenAI-compatible multimodal analysis client."""
 
@@ -102,12 +242,15 @@ class ArkVLMClient:
         try:
             with httpx.Client(timeout=self.timeout_s) as client:
                 response = client.post(url, headers=headers, json=payload)
+                if response.status_code == 400 and _response_format_unsupported(response):
+                    payload.pop("response_format", None)
+                    response = client.post(url, headers=headers, json=payload)
         except httpx.HTTPError as exc:
             raise ArkError(f"视频理解提交失败：{exc}") from exc
         data = _json_or_error(response, label="视频理解")
         text = _extract_message_text(data)
         try:
-            return json.loads(text)
+            return _parse_json_text(text)
         except json.JSONDecodeError as exc:
             raise ArkError(f"视频理解响应不是严格 JSON：{text[:500]}") from exc
 
@@ -127,14 +270,15 @@ def run_source_analysis(
         raise PipelineError(f"输入视频不存在：{video}")
     analysis_model = analysis_model or config.analysis_model
     asr_model = asr_model or config.asr_model
+    doubao_asr_available = _doubao_asr_available(config)
     if not allow_skeleton:
         missing: list[str] = []
         if not config.api_key:
             missing.append("ARK_API_KEY")
         if not analysis_model:
             missing.append("SEEDANCE_ROLE_SCENE_ANALYSIS_MODEL 或 --analysis-model")
-        if not asr_model:
-            missing.append("SEEDANCE_ROLE_SCENE_ASR_MODEL 或 --asr-model")
+        if not asr_model and not doubao_asr_available:
+            missing.append("SEEDANCE_ROLE_SCENE_ASR_MODEL 或豆包流式 ASR 凭据")
         if missing:
             raise PipelineError("缺少原视频分析配置：" + "、".join(missing) + "。默认不输出低质量骨架；调试可加 --allow-skeleton。")
     if sample_seconds <= 0:
@@ -153,7 +297,15 @@ def run_source_analysis(
     asr_audio = audio_dir / "source_16k.wav"
     has_audio = extract_audio_for_asr(video, asr_audio)
     transcript = _skeleton_transcript()
-    if has_audio and asr_model and config.api_key:
+    if has_audio and _use_doubao_asr(config=config, asr_model=asr_model):
+        transcript = DoubaoStreamingASRClient(
+            app_id=config.doubao_asr_app_id,
+            access_token=config.doubao_asr_access_token,
+            resource_id=config.doubao_asr_resource_id,
+            ws_url=config.doubao_asr_ws_url,
+            timeout_s=config.request_timeout_s,
+        ).transcribe(asr_audio)
+    elif has_audio and asr_model and config.api_key:
         transcript = ArkASRClient(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -325,9 +477,16 @@ def _extract_analysis_frames(video: Path, *, frames_dir: Path, job_dir: Path, sa
     frames: list[AnalysisFrame] = []
     for index, timestamp in enumerate(sorted(timestamps)):
         output = frames_dir / f"frame_{index:04d}_{timestamp:08.3f}.jpg"
-        extract_frame_at(video, output, timestamp)
+        _extract_analysis_frame_at(video, output, timestamp)
         frames.append(AnalysisFrame(id=f"frame_{index:04d}", timestamp=timestamp, path=_relative(output, job_dir), kind="scene" if timestamp in timestamps else "sample"))
     return frames
+
+
+def _extract_analysis_frame_at(video: Path, output: Path, timestamp: float) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    duration = get_video_duration(video)
+    at = max(0.0, min(timestamp, max(0.0, duration - 0.05)))
+    run_cmd(["ffmpeg", "-y", "-ss", f"{at:.3f}", "-i", str(video), "-vf", "scale=360:-1", "-frames:v", "1", "-q:v", "4", str(output)])
 
 
 def _normalize_analysis(
@@ -348,6 +507,7 @@ def _normalize_analysis(
         scenes = [{"id": "scene_01", "name": "源视频主要场景", "description": "请人工检查源场景。", "confidence": 0.5, "confirmed": False, "evidence_paths": [frame.path for frame in frames[:3]]}]
     props = _normalize_entities(raw.get("props") or raw.get("objects"), prefix="prop", default_name="未知道具", frames=frames)
     voices = _normalize_voices(raw.get("voices") or raw.get("speakers"), transcript_items=transcript_items)
+    _attach_dialogue_voice_samples(voices=voices, shots=shots, transcript_items=transcript_items, characters=characters)
     review_items = _review_items(characters=characters, scenes=scenes, props=props, voices=voices, shots=shots)
     low_confidence = _low_confidence_items(characters + scenes + props + voices + shots)
     payload: dict[str, Any] = {
@@ -546,10 +706,10 @@ def _normalize_shots(items: Any, *, frames: list[AnalysisFrame], transcript: lis
                 "scene_description": str(item.get("scene_description") or item.get("environment") or "").strip(),
                 "camera": str(item.get("camera") or item.get("shot_size") or "").strip(),
                 "action": str(item.get("action") or item.get("actions") or "").strip(),
-                "character_ids": list(item.get("character_ids") or []),
-                "scene_id": str(item.get("scene_id") or ""),
-                "prop_ids": list(item.get("prop_ids") or []),
-                "dialogues": list(item.get("dialogues") or _dialogues_in_range(transcript, start, end)),
+                "character_ids": _safe_id_list(item.get("character_ids") or []),
+                "scene_id": _safe_optional_id(item.get("scene_id")),
+                "prop_ids": _safe_id_list(item.get("prop_ids") or []),
+                "dialogues": _normalize_dialogues(item.get("dialogues") or _dialogues_in_range(transcript, start, end)),
                 "sounds": list(item.get("sounds") or []),
                 "confidence": float(item.get("confidence") or 0.5),
                 "confirmed": bool(item.get("confirmed", False)),
@@ -584,6 +744,22 @@ def _normalize_entities(items: Any, *, prefix: str, default_name: str, frames: l
     return result
 
 
+def _normalize_dialogues(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        dialogue = dict(item)
+        if dialogue.get("speaker"):
+            dialogue["speaker"] = _safe_optional_id(dialogue.get("speaker"))
+        if dialogue.get("character_id"):
+            dialogue["character_id"] = _safe_optional_id(dialogue.get("character_id"))
+        result.append(dialogue)
+    return result
+
+
 def _normalize_voices(items: Any, *, transcript_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_speaker: dict[str, list[dict[str, Any]]] = {}
     for item in transcript_items:
@@ -595,13 +771,14 @@ def _normalize_voices(items: Any, *, transcript_items: list[dict[str, Any]]) -> 
             if not isinstance(item, dict):
                 continue
             voice_id = _safe_id(str(item.get("id") or item.get("speaker") or f"voice_{index:02d}"))
-            segments = by_speaker.get(str(item.get("speaker") or voice_id), [])
+            speaker_key = str(item.get("speaker") or "").strip()
+            segments = by_speaker.get(speaker_key, []) if speaker_key and speaker_key != "voice_unknown" else []
             result.append(
                 {
                     "id": voice_id,
                     "name": str(item.get("name") or item.get("speaker") or voice_id),
                     "description": str(item.get("description") or "").strip(),
-                    "character_id": str(item.get("character_id") or ""),
+                    "character_id": _safe_optional_id(item.get("character_id")),
                     "confidence": float(item.get("confidence") or 0.5),
                     "confirmed": bool(item.get("confirmed", False)),
                     "sample_ranges": _sample_ranges(segments),
@@ -625,6 +802,202 @@ def _normalize_voices(items: Any, *, transcript_items: list[dict[str, Any]]) -> 
             }
         )
     return result
+
+
+def _attach_dialogue_voice_samples(
+    *,
+    voices: list[dict[str, Any]],
+    shots: list[dict[str, Any]],
+    transcript_items: list[dict[str, Any]],
+    characters: list[dict[str, Any]] | None = None,
+) -> None:
+    voice_by_char = {_safe_optional_id(item.get("character_id")): item for item in voices if item.get("character_id")}
+    char_ref_map = _character_reference_map(characters or [])
+    used: set[int] = set()
+    existing_by_voice: dict[int, set[tuple[float, float, str]]] = {}
+    for voice in voices:
+        key = id(voice)
+        existing_by_voice[key] = {_segment_key(segment) for segment in voice.get("transcript_segments") or [] if isinstance(segment, dict)}
+    for shot in shots:
+        for dialogue in shot.get("dialogues") or []:
+            if not isinstance(dialogue, dict):
+                continue
+            speaker_ref = _safe_optional_id(dialogue.get("speaker") or dialogue.get("character_id") or "")
+            voice = voice_by_char.get(char_ref_map.get(speaker_ref, speaker_ref))
+            if not voice:
+                continue
+            match_index = _best_transcript_match(str(dialogue.get("text") or ""), transcript_items, used)
+            if match_index is None:
+                continue
+            used.add(match_index)
+            segment = dict(transcript_items[match_index])
+            voice_key = id(voice)
+            segment_key = _segment_key(segment)
+            if segment_key in existing_by_voice.setdefault(voice_key, set()):
+                continue
+            existing_by_voice[voice_key].add(segment_key)
+            voice.setdefault("transcript_segments", []).append(segment)
+    for voice in voices:
+        segments = voice.get("transcript_segments") or []
+        if segments:
+            voice["sample_ranges"] = _sample_ranges(segments)
+
+
+def _segment_key(segment: dict[str, Any]) -> tuple[float, float, str]:
+    return (
+        round(float(segment.get("start") or 0), 2),
+        round(float(segment.get("end") or 0), 2),
+        _clean_text(str(segment.get("text") or "")),
+    )
+
+
+def _character_reference_map(characters: list[dict[str, Any]]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for character in characters:
+        if not isinstance(character, dict):
+            continue
+        character_id = _safe_optional_id(character.get("id"))
+        if not character_id:
+            continue
+        result[character_id] = character_id
+        name = _safe_optional_id(character.get("name"))
+        if name:
+            result[name] = character_id
+        for alias in character.get("aliases") or []:
+            alias_id = _safe_optional_id(alias)
+            if alias_id:
+                result[alias_id] = character_id
+    return result
+
+
+def _best_transcript_match(text: str, transcript_items: list[dict[str, Any]], used: set[int]) -> int | None:
+    target = _clean_text(text)
+    if not target:
+        return None
+    best_index: int | None = None
+    best_score = 0.0
+    for index, item in enumerate(transcript_items):
+        if index in used:
+            continue
+        candidate = _clean_text(str(item.get("text") or ""))
+        if not candidate:
+            continue
+        if target == candidate:
+            score = 1.0
+        elif target in candidate or candidate in target:
+            score = min(len(target), len(candidate)) / max(len(target), len(candidate))
+        else:
+            score = SequenceMatcher(None, target, candidate).ratio()
+        if score > best_score:
+            best_index = index
+            best_score = score
+    return best_index if best_score >= 0.72 else None
+
+
+def _clean_text(value: str) -> str:
+    return "".join(char.lower() for char in value if char.isalnum())
+
+
+def _normalize_doubao_asr_responses(responses: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = []
+    for item in responses:
+        candidates.extend(_walk_dicts(item))
+    utterances: list[dict[str, Any]] = []
+    text = ""
+    for item in candidates:
+        result = item.get("result") if isinstance(item.get("result"), dict) else item
+        if not isinstance(result, dict):
+            continue
+        if isinstance(result.get("text"), str) and result["text"].strip():
+            text = result["text"].strip()
+        raw_utterances = result.get("utterances") or result.get("utterance") or result.get("segments")
+        if isinstance(raw_utterances, list):
+            for index, utt in enumerate(raw_utterances):
+                if not isinstance(utt, dict):
+                    continue
+                if utt.get("definite") is False:
+                    continue
+                utt_text = str(utt.get("text") or utt.get("utterance") or "").strip()
+                if not utt_text:
+                    continue
+                start = _asr_time_to_seconds(utt.get("start_time", utt.get("start", 0)))
+                end = _asr_time_to_seconds(utt.get("end_time", utt.get("end", start)))
+                utterances.append(
+                    {
+                        "id": str(utt.get("id") or f"utt_{len(utterances):03d}"),
+                        "start": start,
+                        "end": max(end, start),
+                        "text": utt_text,
+                        "speaker": str(utt.get("speaker") or utt.get("speaker_id") or "voice_unknown"),
+                    }
+                )
+    utterances = _dedupe_asr_utterances(utterances)
+    if not utterances and text:
+        utterances = [{"id": "utt_000", "start": 0.0, "end": 0.0, "text": text, "speaker": "voice_unknown"}]
+    if not text:
+        text = " ".join(item["text"] for item in utterances)
+    return {"text": text, "segments": utterances, "raw": responses}
+
+
+def _walk_dicts(value: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        result.append(value)
+        for child in value.values():
+            result.extend(_walk_dicts(child))
+    elif isinstance(value, list):
+        for child in value:
+            result.extend(_walk_dicts(child))
+    return result
+
+
+def _asr_time_to_seconds(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number >= 100:
+        return number / 1000.0
+    return number
+
+
+def _dedupe_asr_utterances(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_time: dict[tuple[str, float, float], dict[str, Any]] = {}
+    for item in items:
+        key = (str(item.get("speaker") or ""), round(float(item.get("start") or 0), 2), round(float(item.get("end") or 0), 2))
+        current = by_time.get(key)
+        if current is None or len(str(item.get("text") or "")) > len(str(current.get("text") or "")):
+            by_time[key] = item
+    ordered = sorted(by_time.values(), key=lambda item: (float(item.get("start") or 0), float(item.get("end") or 0), -len(str(item.get("text") or ""))))
+    result: list[dict[str, Any]] = []
+    for item in ordered:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(item.get("start") or 0)
+        skip = False
+        for kept in result[-8:]:
+            kept_text = str(kept.get("text") or "").strip()
+            kept_start = float(kept.get("start") or 0)
+            if abs(start - kept_start) <= 0.08 and (text == kept_text or text.startswith(kept_text) or kept_text.startswith(text)):
+                if len(text) > len(kept_text):
+                    kept.update(item)
+                skip = True
+                break
+        if not skip:
+            item["id"] = f"utt_{len(result):03d}"
+            result.append(item)
+    return result
+
+
+def _doubao_asr_available(config: AppConfig) -> bool:
+    return bool(config.doubao_asr_app_id and config.doubao_asr_access_token)
+
+
+def _use_doubao_asr(*, config: AppConfig, asr_model: str) -> bool:
+    provider = (config.asr_provider or "").lower().replace("-", "_")
+    model = (asr_model or config.asr_model or "").lower().replace("-", "_")
+    return _doubao_asr_available(config) and (provider in {"doubao", "doubao_streaming", "seedasr"} or model in {"doubao_streaming_2.0", "doubao_streaming_2_0", "seedasr_2.0", "seedasr_2_0"})
 
 
 def _skeleton_visual_analysis(*, frames: list[AnalysisFrame], transcript: dict[str, Any], duration: float) -> dict[str, Any]:
@@ -782,6 +1155,34 @@ def _json_or_error(response: httpx.Response, *, label: str) -> dict[str, Any]:
     return data
 
 
+def _response_format_unsupported(response: httpx.Response) -> bool:
+    try:
+        data = response.json()
+    except ValueError:
+        return False
+    message = str(data.get("message") or data.get("error") or data)
+    return "response_format" in message and ("not valid" in message or "not supported" in message)
+
+
+def _parse_json_text(text: str) -> dict[str, Any]:
+    value = text.strip()
+    if value.startswith("```"):
+        lines = value.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        value = "\n".join(lines).strip()
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        start = value.find("{")
+        end = value.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(value[start : end + 1])
+        raise
+
+
 def _extract_message_text(data: dict[str, Any]) -> str:
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
@@ -805,6 +1206,17 @@ def _safe_id(value: str) -> str:
         if char.isalnum() or char == "_":
             allowed.append(char)
     return "".join(allowed) or "auto_id"
+
+
+def _safe_optional_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return _safe_id(text) if text else ""
+
+
+def _safe_id_list(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    return [_safe_id(str(value)) for value in values if str(value or "").strip()]
 
 
 def _relative(path: Path, base: Path) -> str:

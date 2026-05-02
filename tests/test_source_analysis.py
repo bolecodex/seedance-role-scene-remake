@@ -7,6 +7,7 @@ from seedance_role_scene_remake.analysis import (
     ArkASRClient,
     ArkVLMClient,
     AnalysisFrame,
+    DoubaoStreamingASRClient,
     format_script_markdown,
     run_source_analysis,
     summarize_source_analysis,
@@ -175,3 +176,136 @@ def test_asr_client_payload_contains_audio_file(tmp_path: Path, monkeypatch):
     assert captured["url"] == "https://ark/asr"
     assert captured["data"]["model"] == "asr"
     assert "file" in captured["files"]
+
+
+def test_doubao_streaming_asr_normalizes_ws_utterances(tmp_path: Path, monkeypatch):
+    audio = tmp_path / "audio.wav"
+    audio.write_bytes(b"fake wav")
+    sent = []
+
+    class FakeWS:
+        def __init__(self):
+            self.count = 0
+
+        def send_binary(self, payload):
+            sent.append(payload)
+
+        def recv(self):
+            self.count += 1
+            if self.count == 1:
+                return _doubao_packet({"result": {"text": ""}})
+            return _doubao_packet(
+                {
+                    "result": {
+                        "text": "hello world",
+                        "utterances": [{"start_time": 0, "end_time": 1200, "text": "hello world", "speaker": "speaker_1"}],
+                    }
+                }
+            )
+
+        def close(self):
+            pass
+
+    captured = {}
+
+    def fake_create_connection(url, header, timeout):
+        captured["url"] = url
+        captured["header"] = header
+        captured["timeout"] = timeout
+        return FakeWS()
+
+    monkeypatch.setattr("seedance_role_scene_remake.analysis.websocket.create_connection", fake_create_connection)
+
+    result = DoubaoStreamingASRClient(
+        app_id="app",
+        access_token="token",
+        resource_id="volc.bigasr.sauc.duration",
+        ws_url="wss://example.com/ws",
+        timeout_s=3,
+    ).transcribe(audio)
+
+    assert captured["url"] == "wss://example.com/ws"
+    assert any(item.startswith("X-Api-App-Key: ") for item in captured["header"])
+    assert any(item.startswith("X-Api-Resource-Id: volc.bigasr.sauc.duration") for item in captured["header"])
+    assert len(sent) == 2
+    assert result["segments"][0]["text"] == "hello world"
+    assert result["segments"][0]["end"] == 1.2
+
+
+def test_doubao_streaming_asr_dedupes_incremental_segments():
+    from seedance_role_scene_remake.analysis import _normalize_doubao_asr_responses
+
+    result = _normalize_doubao_asr_responses(
+        [
+            {"result": {"utterances": [{"start_time": 440, "end_time": 1000, "text": "You", "speaker": "s"}]}},
+            {"result": {"utterances": [{"start_time": 440, "end_time": 1000, "text": "You need to leave.", "speaker": "s"}]}},
+            {"result": {"utterances": [{"start_time": 1720, "end_time": 2200, "text": "How dare you?", "speaker": "s"}]}},
+        ]
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["segments"][0]["start"] == 0.44
+    assert result["segments"][0]["text"] == "You need to leave."
+    assert result["segments"][1]["start"] == 1.72
+
+
+def test_voice_samples_attach_from_dialogue_text():
+    from seedance_role_scene_remake.analysis import _attach_dialogue_voice_samples
+
+    voices = [{"id": "v1", "character_id": "char001", "sample_ranges": [], "transcript_segments": []}]
+    shots = [{"dialogues": [{"speaker": "char001", "text": "What a beautiful princess."}]}]
+    transcript_items = [{"start": 25.6, "end": 26.7, "text": "What a beautiful princess.", "speaker": "voice_unknown"}]
+
+    _attach_dialogue_voice_samples(voices=voices, shots=shots, transcript_items=transcript_items)
+
+    assert voices[0]["sample_ranges"] == [{"start": 25.6, "end": 26.7}]
+    assert voices[0]["transcript_segments"][0]["text"] == "What a beautiful princess."
+
+
+def test_voice_samples_attach_normalizes_character_ids():
+    from seedance_role_scene_remake.analysis import _attach_dialogue_voice_samples
+
+    voices = [{"id": "v1", "character_id": "c001", "sample_ranges": [], "transcript_segments": []}]
+    shots = [{"dialogues": [{"speaker": "C001", "text": "Fine."}]}]
+    transcript_items = [{"start": 52.2, "end": 52.7, "text": "Fine.", "speaker": "voice_unknown"}]
+
+    _attach_dialogue_voice_samples(voices=voices, shots=shots, transcript_items=transcript_items)
+
+    assert voices[0]["sample_ranges"] == [{"start": 52.2, "end": 52.7}]
+
+
+def test_voice_samples_attach_resolves_character_names():
+    from seedance_role_scene_remake.analysis import _attach_dialogue_voice_samples
+
+    voices = [{"id": "v1", "character_id": "char_001", "sample_ranges": [], "transcript_segments": []}]
+    characters = [{"id": "char_001", "name": "男主"}]
+    shots = [{"dialogues": [{"speaker": "男主", "text": "You need to leave."}]}]
+    transcript_items = [{"start": 0.44, "end": 1.0, "text": "You need to leave.", "speaker": "voice_unknown"}]
+
+    _attach_dialogue_voice_samples(voices=voices, shots=shots, transcript_items=transcript_items, characters=characters)
+
+    assert voices[0]["sample_ranges"] == [{"start": 0.44, "end": 1.0}]
+
+
+def test_vlm_voice_without_speaker_does_not_inherit_unknown_asr_segments():
+    from seedance_role_scene_remake.analysis import _normalize_voices
+
+    voices = _normalize_voices(
+        [{"id": "v1", "character_id": "c001", "speaker": "voice_unknown"}],
+        transcript_items=[{"start": 0.0, "end": 1.0, "text": "hello", "speaker": "voice_unknown"}],
+    )
+
+    assert voices[0]["id"] == "v1"
+    assert voices[0]["transcript_segments"] == []
+    assert voices[1]["id"] == "voice_unknown"
+    assert len(voices[1]["transcript_segments"]) == 1
+
+
+def _doubao_packet(payload: dict) -> bytes:
+    import gzip
+    import json
+    import struct
+
+    body = gzip.compress(json.dumps(payload).encode("utf-8"))
+    header = bytes([(1 << 4) | 1, (9 << 4), (1 << 4) | 1, 0])
+    return header + struct.pack(">I", len(body)) + body

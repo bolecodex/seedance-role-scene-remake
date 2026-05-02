@@ -15,6 +15,8 @@ DEFAULT_MODEL = "doubao-seedance-2-0-260128"
 DEFAULT_SEEDREAM_MODEL = "doubao-seedream-5-0-lite-260128"
 DEFAULT_ANALYSIS_ENDPOINT = "/api/v3/chat/completions"
 DEFAULT_ASR_ENDPOINT = "/api/v3/audio/transcriptions"
+DEFAULT_DOUBAO_ASR_WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+DEFAULT_DOUBAO_ASR_RESOURCE_ID = "volc.bigasr.sauc.duration"
 
 
 @dataclass
@@ -32,6 +34,12 @@ class AppConfig:
     analysis_endpoint: str = DEFAULT_ANALYSIS_ENDPOINT
     asr_model: str = ""
     asr_endpoint: str = DEFAULT_ASR_ENDPOINT
+    asr_provider: str = "ark"
+    doubao_asr_app_id: str = ""
+    doubao_asr_access_token: str = ""
+    doubao_asr_secret_key: str = ""
+    doubao_asr_ws_url: str = DEFAULT_DOUBAO_ASR_WS_URL
+    doubao_asr_resource_id: str = DEFAULT_DOUBAO_ASR_RESOURCE_ID
     request_timeout_s: int = 120
     poll_interval_s: int = 10
     poll_max_wait_s: int = 1800
@@ -102,6 +110,12 @@ def load_config(overrides: dict[str, Any] | None = None) -> AppConfig:
         "analysis_endpoint": os.getenv("SEEDANCE_ROLE_SCENE_ANALYSIS_ENDPOINT", DEFAULT_ANALYSIS_ENDPOINT),
         "asr_model": os.getenv("SEEDANCE_ROLE_SCENE_ASR_MODEL", ""),
         "asr_endpoint": os.getenv("SEEDANCE_ROLE_SCENE_ASR_ENDPOINT", DEFAULT_ASR_ENDPOINT),
+        "asr_provider": os.getenv("SEEDANCE_ROLE_SCENE_ASR_PROVIDER", "ark"),
+        "doubao_asr_app_id": os.getenv("SEEDANCE_ROLE_SCENE_DOUBAO_ASR_APP_ID", ""),
+        "doubao_asr_access_token": os.getenv("SEEDANCE_ROLE_SCENE_DOUBAO_ASR_ACCESS_TOKEN", ""),
+        "doubao_asr_secret_key": os.getenv("SEEDANCE_ROLE_SCENE_DOUBAO_ASR_SECRET_KEY", ""),
+        "doubao_asr_ws_url": os.getenv("SEEDANCE_ROLE_SCENE_DOUBAO_ASR_WS_URL", DEFAULT_DOUBAO_ASR_WS_URL),
+        "doubao_asr_resource_id": os.getenv("SEEDANCE_ROLE_SCENE_DOUBAO_ASR_RESOURCE_ID", DEFAULT_DOUBAO_ASR_RESOURCE_ID),
         "request_timeout_s": _int_env("SEEDANCE_ROLE_SCENE_REQUEST_TIMEOUT", 120),
         "poll_interval_s": _int_env("SEEDANCE_ROLE_SCENE_POLL_INTERVAL", 10),
         "poll_max_wait_s": _int_env("SEEDANCE_ROLE_SCENE_POLL_MAX_WAIT", 1800),
