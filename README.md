@@ -261,7 +261,9 @@ seedance-role-scene-remake merge ./job_input_remake/manifest.json -o ./final_inp
 analysis/                         原视频分析和人工检查包
 analysis/script/剧本.md            中文剧本
 analysis/roles/                   源角色人工检查包，每个角色一个独立文件夹
-analysis/characters/              源角色证据
+analysis/roles/*/person_crops/    bbox 裁出的单角色截图
+analysis/roles/*/full_frames/     原始全帧证据，可能包含其他人物
+analysis/characters/              机器可读源角色 profile 和全帧证据
 analysis/scenes/                  源场景证据
 analysis/props/                   源道具证据
 analysis/voices/                  源声音样本和转写

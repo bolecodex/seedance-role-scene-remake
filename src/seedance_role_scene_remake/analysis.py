@@ -20,6 +20,7 @@ import websocket
 from seedance_role_scene_remake.config import AppConfig
 from seedance_role_scene_remake.errors import ArkError, PipelineError
 from seedance_role_scene_remake.ffmpeg import (
+    crop_image,
     detect_scene_timestamps,
     extract_audio_clip,
     extract_audio_for_asr,
@@ -615,18 +616,39 @@ def _write_role_review_package(payload: dict[str, Any], *, output: Path) -> None
             continue
         role_id = _safe_id(str(character.get("id") or "role"))
         base = roles_dir / role_id
-        evidence_dir = base / "evidence"
+        full_frames_dir = base / "full_frames"
+        person_crops_dir = base / "person_crops"
         samples_dir = base / "voice_samples"
-        evidence_dir.mkdir(parents=True, exist_ok=True)
+        full_frames_dir.mkdir(parents=True, exist_ok=True)
+        person_crops_dir.mkdir(parents=True, exist_ok=True)
         samples_dir.mkdir(parents=True, exist_ok=True)
 
-        evidence_paths: list[str] = []
-        seen_evidence: set[str] = set()
+        full_frame_paths: list[str] = []
+        seen_full_frames: set[str] = set()
         for rel in character.get("evidence_paths") or []:
-            copied = _copy_analysis_asset(output / rel, evidence_dir, output)
-            if copied and copied not in seen_evidence:
-                seen_evidence.add(copied)
-                evidence_paths.append(copied)
+            copied = _copy_analysis_asset(output / rel, full_frames_dir, output)
+            if copied and copied not in seen_full_frames:
+                seen_full_frames.add(copied)
+                full_frame_paths.append(copied)
+
+        person_crop_paths: list[str] = []
+        seen_crops: set[str] = set()
+        for idx, region in enumerate(character.get("evidence_regions") or []):
+            if not isinstance(region, dict):
+                continue
+            source_rel = str(region.get("frame_path") or "")
+            bbox = region.get("bbox")
+            if not source_rel or not isinstance(bbox, list):
+                continue
+            crop_path = person_crops_dir / f"crop_{idx:02d}_{Path(source_rel).stem}.jpg"
+            try:
+                crop_image(output / source_rel, crop_path, [int(value) for value in bbox[:4]])
+            except Exception:
+                continue
+            copied = _relative(crop_path, output)
+            if copied and copied not in seen_crops:
+                seen_crops.add(copied)
+                person_crop_paths.append(copied)
 
         role_voices: list[dict[str, Any]] = []
         for voice in voices_by_character.get(role_id, []):
@@ -657,7 +679,9 @@ def _write_role_review_package(payload: dict[str, Any], *, output: Path) -> None
             "confidence": character.get("confidence"),
             "confirmed": character.get("confirmed", False),
             "source_character_profile": character.get("profile_path"),
-            "evidence_paths": evidence_paths,
+            "full_frame_paths": full_frame_paths,
+            "person_crop_paths": person_crop_paths,
+            "evidence_regions": character.get("evidence_regions") or [],
             "voices": role_voices,
         }
         role_payload["profile_path"] = _relative(base / "profile.json", output)
@@ -681,10 +705,14 @@ def _copy_analysis_asset(source: Path, target_dir: Path, job_dir: Path) -> str:
 
 
 def _write_role_contact_sheet(role: dict[str, Any], output: Path, *, job_dir: Path) -> None:
-    images = []
-    for rel in role.get("evidence_paths") or []:
+    crops = []
+    for rel in role.get("person_crop_paths") or []:
         src = html.escape(_html_rel(output.parent, job_dir / rel))
-        images.append(f'<img src="{src}" alt="{html.escape(rel)}">')
+        crops.append(f'<img src="{src}" alt="{html.escape(rel)}">')
+    full_frames = []
+    for rel in role.get("full_frame_paths") or []:
+        src = html.escape(_html_rel(output.parent, job_dir / rel))
+        full_frames.append(f'<img src="{src}" alt="{html.escape(rel)}">')
     voice_sections = []
     for voice in role.get("voices") or []:
         if not isinstance(voice, dict):
@@ -711,8 +739,12 @@ def _write_role_contact_sheet(role: dict[str, Any], output: Path, *, job_dir: Pa
 <h1>{html.escape(str(role.get('name') or role.get('id') or 'role'))}</h1>
 <p>{html.escape(str(role.get('description') or ''))}</p>
 <p>role_id={html.escape(str(role.get('id') or ''))} confidence={html.escape(str(role.get('confidence', '-')))} confirmed={html.escape(str(role.get('confirmed', False)))}</p>
-<h2>角色证据帧</h2>
-<div>{''.join(images) or '无证据帧'}</div>
+<h2>人物裁剪</h2>
+<p>这里才是按 bbox 裁出的单角色截图；若为空，说明分析模型没有给出可靠人物框，需要人工补充。</p>
+<div>{''.join(crops) or '无人物裁剪'}</div>
+<h2>原始全帧证据</h2>
+<p>全帧只用于定位来源镜头，可能包含其他人物，不应视为单人参考图。</p>
+<div>{''.join(full_frames) or '无全帧证据'}</div>
 <h2>关联声音</h2>
 {''.join(voice_sections) or '<p>无关联声音样本</p>'}
 <h2>结构化信息</h2>
@@ -728,7 +760,7 @@ def _write_roles_index(roles: list[dict[str, Any]], output: Path, *, job_dir: Pa
         if not isinstance(role, dict):
             continue
         images = []
-        for rel in (role.get("evidence_paths") or [])[:4]:
+        for rel in (role.get("person_crop_paths") or role.get("full_frame_paths") or [])[:4]:
             images.append(f'<img src="{html.escape(_html_rel(output.parent, job_dir / rel))}" alt="{html.escape(rel)}">')
         voice_count = sum(len(voice.get("sample_paths") or []) for voice in role.get("voices") or [] if isinstance(voice, dict))
         link = html.escape(_html_rel(output.parent, job_dir / str(role.get("contact_sheet_path") or "")))
@@ -744,8 +776,8 @@ def _write_roles_index(roles: list[dict[str, Any]], output: Path, *, job_dir: Pa
     output.write_text(
         f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:24px;line-height:1.5}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}img{{width:120px;margin:3px}}</style></head><body>
 <h1>源角色人工检查</h1>
-<p>每个角色有独立文件夹，集中展示源角色证据帧、关联声音样本和对白转写。该目录只用于理解原片和人工检查，不作为目标角色外观。</p>
-<table><thead><tr><th>角色 ID</th><th>名称</th><th>置信度</th><th>声音样本数</th><th>证据帧</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="5">暂无角色候选</td></tr>'}</tbody></table>
+<p>每个角色有独立文件夹，集中展示人物裁剪、原始全帧证据、关联声音样本和对白转写。人物裁剪来自 bbox；全帧可能包含其他人物，只用于来源复核。</p>
+<table><thead><tr><th>角色 ID</th><th>名称</th><th>置信度</th><th>声音样本数</th><th>人物裁剪/全帧</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="5">暂无角色候选</td></tr>'}</tbody></table>
 </body></html>""",
         encoding="utf-8",
     )
@@ -895,9 +927,73 @@ def _normalize_entities(items: Any, *, prefix: str, default_name: str, frames: l
                 "confidence": float(item.get("confidence") or 0.5),
                 "confirmed": bool(item.get("confirmed", False)),
                 "evidence_paths": evidence,
+                "evidence_regions": _normalize_evidence_regions(item, frames=frames),
             }
         )
     return result
+
+
+def _normalize_evidence_regions(item: dict[str, Any], *, frames: list[AnalysisFrame]) -> list[dict[str, Any]]:
+    raw_regions = item.get("evidence_regions") or item.get("person_regions") or item.get("regions") or []
+    if not isinstance(raw_regions, list):
+        raw_regions = []
+    if not raw_regions and isinstance(item.get("bbox"), list):
+        raw_regions = [{"bbox": item.get("bbox"), "timestamp": (item.get("evidence_timestamps") or [None])[0]}]
+
+    regions: list[dict[str, Any]] = []
+    for raw in raw_regions:
+        if not isinstance(raw, dict):
+            continue
+        bbox = _normalize_bbox(raw.get("bbox") or raw.get("box"))
+        if not bbox:
+            continue
+        frame_path = _frame_path_for_region(raw, frames=frames)
+        if not frame_path:
+            continue
+        regions.append(
+            {
+                "frame_path": frame_path,
+                "bbox": bbox,
+                "note": str(raw.get("note") or raw.get("description") or "").strip(),
+                "confidence": float(raw.get("confidence") or item.get("confidence") or 0.5),
+            }
+        )
+    return regions
+
+
+def _normalize_bbox(value: Any) -> list[int]:
+    if not isinstance(value, list) or len(value) < 4:
+        return []
+    try:
+        bbox = [int(round(float(item))) for item in value[:4]]
+    except (TypeError, ValueError):
+        return []
+    if bbox[2] <= 1 or bbox[3] <= 1:
+        return []
+    return bbox
+
+
+def _frame_path_for_region(region: dict[str, Any], *, frames: list[AnalysisFrame]) -> str:
+    frame_ref = str(region.get("frame_path") or region.get("image_path") or region.get("path") or "").strip()
+    if frame_ref:
+        for frame in frames:
+            if frame.path == frame_ref or Path(frame.path).name == Path(frame_ref).name:
+                return frame.path
+    frame_id = str(region.get("frame_id") or "").strip()
+    if frame_id:
+        for frame in frames:
+            if frame.id == frame_id:
+                return frame.path
+    timestamp = region.get("timestamp")
+    if timestamp is None:
+        timestamp = region.get("time")
+    if timestamp is None:
+        return ""
+    try:
+        value = float(timestamp)
+    except (TypeError, ValueError):
+        return ""
+    return _nearest_frame_path(frames, value)
 
 
 def _normalize_dialogues(items: Any) -> list[dict[str, Any]]:
@@ -1209,12 +1305,12 @@ ASR 转写候选：
 {{
   "synopsis": "全片剧情摘要",
   "shots": [{{"id":"1-1","start":0,"end":2.0,"summary":"","description":"","scene_description":"","camera":"近景/中景/全景/特写","action":"","character_ids":[],"scene_id":"","prop_ids":[],"dialogues":[{{"speaker":"","text":"","emotion":"","type":"dialogue/os/narration"}}],"sounds":[],"confidence":0.0,"evidence_paths":[]}}],
-  "characters": [{{"id":"","name":"","description":"","evidence_timestamps":[],"confidence":0.0,"confirmed":false}}],
+  "characters": [{{"id":"","name":"","description":"","evidence_timestamps":[],"evidence_regions":[{{"frame_id":"frame_0000","timestamp":0.0,"bbox":[x,y,w,h],"note":"单个角色可见区域"}}],"confidence":0.0,"confirmed":false}}],
   "source_scenes": [{{"id":"","name":"","description":"","evidence_timestamps":[],"confidence":0.0,"confirmed":false}}],
   "props": [{{"id":"","name":"","description":"","evidence_timestamps":[],"confidence":0.0,"confirmed":false}}],
   "voices": [{{"id":"","name":"","description":"","character_id":"","speaker":"","confidence":0.0,"confirmed":false}}]
 }}
-要求：剧本分场接近“1-1/1-2”格式；角色、场景、道具必须便于人工复核；不要把目标替换设定写入这里，只描述原视频。"""
+要求：剧本分场接近“1-1/1-2”格式；角色、场景、道具必须便于人工复核；characters.evidence_regions 必须尽量给出单个角色在关键帧中的 bbox，坐标以关键帧图片像素为准，不要用整帧 bbox 代替单人框；不要把目标替换设定写入这里，只描述原视频。"""
 
 
 def _dialogues_in_range(transcript: list[dict[str, Any]], start: float, end: float) -> list[dict[str, Any]]:
@@ -1232,7 +1328,13 @@ def _nearest_frame_paths(frames: list[AnalysisFrame], start: float, end: float) 
     if not frames:
         return []
     center = (start + end) / 2
-    return [min(frames, key=lambda frame: abs(frame.timestamp - center)).path]
+    return [_nearest_frame_path(frames, center)]
+
+
+def _nearest_frame_path(frames: list[AnalysisFrame], timestamp: float) -> str:
+    if not frames:
+        return ""
+    return min(frames, key=lambda frame: abs(frame.timestamp - timestamp)).path
 
 
 def _evidence_from_timestamps(value: Any, frames: list[AnalysisFrame]) -> list[str]:

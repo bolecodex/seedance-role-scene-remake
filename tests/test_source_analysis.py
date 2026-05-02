@@ -114,6 +114,7 @@ def test_role_review_package_groups_character_evidence_and_voice_samples(tmp_pat
                 "confirmed": False,
                 "profile_path": "analysis/characters/char_001/profile.json",
                 "evidence_paths": ["analysis/characters/char_001/evidence/frame.jpg"],
+                "evidence_regions": [{"frame_path": "analysis/characters/char_001/evidence/frame.jpg", "bbox": [1, 2, 30, 40]}],
             }
         ],
         "voices": [
@@ -129,14 +130,41 @@ def test_role_review_package_groups_character_evidence_and_voice_samples(tmp_pat
         ],
     }
 
+    def fake_crop(src: Path, dst: Path, bbox: list[int]) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"crop")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr("seedance_role_scene_remake.analysis.crop_image", fake_crop)
     _write_role_review_package(payload, output=job)
+    monkeypatch.undo()
 
     assert (job / "analysis" / "roles" / "index.html").exists()
     assert (job / "analysis" / "roles" / "char_001" / "profile.json").exists()
     assert (job / "analysis" / "roles" / "char_001" / "contact_sheet.html").exists()
-    assert (job / "analysis" / "roles" / "char_001" / "evidence" / "frame.jpg").exists()
+    assert (job / "analysis" / "roles" / "char_001" / "full_frames" / "frame.jpg").exists()
+    assert (job / "analysis" / "roles" / "char_001" / "person_crops" / "crop_00_frame.jpg").exists()
     assert (job / "analysis" / "roles" / "char_001" / "voice_samples" / "sample.m4a").exists()
     assert payload["characters"][0]["role_review_path"] == "analysis/roles/char_001/contact_sheet.html"
+
+
+def test_normalize_entities_keeps_character_bbox_regions():
+    from seedance_role_scene_remake.analysis import _normalize_entities
+
+    frames = [AnalysisFrame(id="frame_0000", timestamp=0.0, path="analysis/source/keyframes/frame.jpg")]
+    items = [
+        {
+            "id": "char_001",
+            "name": "男主",
+            "evidence_regions": [{"frame_id": "frame_0000", "bbox": [10.2, 20.8, 80, 160], "confidence": 0.8}],
+        }
+    ]
+
+    result = _normalize_entities(items, prefix="character", default_name="未知角色", frames=frames)
+
+    assert result[0]["evidence_regions"] == [
+        {"frame_path": "analysis/source/keyframes/frame.jpg", "bbox": [10, 21, 80, 160], "note": "", "confidence": 0.8}
+    ]
 
 
 def test_vlm_client_payload_contains_frames_and_json_request(tmp_path: Path, monkeypatch):
