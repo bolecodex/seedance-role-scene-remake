@@ -8,6 +8,7 @@ from seedance_role_scene_remake.analysis import (
     ArkVLMClient,
     AnalysisFrame,
     DoubaoStreamingASRClient,
+    analyze_script_quality,
     format_script_markdown,
     run_source_analysis,
     summarize_source_analysis,
@@ -63,6 +64,79 @@ def test_format_script_markdown_matches_reference_shape():
     assert "音效：手机震动声" in text
 
 
+def test_format_script_markdown_renders_detailed_action_and_delivery():
+    text = format_script_markdown(
+        {
+            "shots": [
+                {
+                    "id": "1-1",
+                    "environment_detail": "礼服店试衣区里，深色丝绒帘垂在女主身后，暖光从侧面打亮她的裙摆。",
+                    "camera_plan": ["中景固定女主从帘前站定，随后切男主近景。"],
+                    "action_beats": [
+                        {"actor": "女主", "description": "双手轻压裙摆边缘，肩膀略微收紧，先低头看裙子再抬眼看向男主。"},
+                        {"actor": "男主", "description": "身体向前倾半寸，视线从裙摆移到女主脸上。"},
+                    ],
+                    "dialogues": [
+                        {
+                            "speaker": "男主",
+                            "text": "Wow, look at you.",
+                            "emotion": "赞赏",
+                            "delivery": "声音放轻，尾音上扬",
+                            "facial_expression": "嘴角抬起",
+                            "gaze": "视线停在女主脸上",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert "动作：女主：双手轻压裙摆边缘" in text
+    assert "镜头/运镜：中景固定女主" in text
+    assert "男主（声音放轻，尾音上扬，嘴角抬起，视线停在女主脸上）：“Wow, look at you.”" in text
+
+
+def test_script_quality_flags_abstract_emotion_and_missing_action_beats():
+    result = analyze_script_quality(
+        {
+            "shots": [
+                {
+                    "id": "1-1",
+                    "environment_detail": "店里",
+                    "camera": "",
+                    "action_beats": [],
+                    "dialogues": [{"speaker": "女主", "text": "What future?", "emotion": "冷淡"}],
+                }
+            ]
+        },
+        min_action_beats=2,
+    )
+
+    issue_types = {item["type"] for item in result["issues"]}
+    assert "abstract_emotion" in issue_types
+    assert "insufficient_action_beats" in issue_types
+    assert "thin_environment_detail" in issue_types
+
+
+def test_script_quality_flags_abstract_words_inside_detailed_state():
+    result = analyze_script_quality(
+        {
+            "shots": [
+                {
+                    "id": "1-1",
+                    "environment_detail": "礼服店内有深色窗帘和木质衣架，暖光落在人物肩部。",
+                    "camera_plan": ["近景固定拍摄女主脸部。"],
+                    "action_beats": [{"description": "女主移开视线。"}, {"description": "女主嘴角压平。"}],
+                    "dialogues": [{"speaker": "女主", "text": "No.", "delivery": "态度冷淡，回答前停顿半拍", "gaze": "视线转向地面"}],
+                }
+            ]
+        },
+        min_action_beats=2,
+    )
+
+    assert any(item["type"] == "abstract_state_detail" for item in result["issues"])
+
+
 def test_run_source_analysis_requires_models_by_default(tmp_path: Path):
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a real video")
@@ -88,6 +162,7 @@ def test_run_source_analysis_allow_skeleton_exports_review_package(tmp_path: Pat
     assert analysis_path.exists()
     assert (tmp_path / "job" / "analysis" / "script" / "剧本.md").exists()
     assert (tmp_path / "job" / "analysis" / "script" / "script.json").exists()
+    assert (tmp_path / "job" / "analysis" / "script" / "script_quality.json").exists()
     assert (tmp_path / "job" / "analysis" / "index.html").exists()
     assert (tmp_path / "job" / "analysis" / "roles" / "index.html").exists()
     assert (tmp_path / "job" / "analysis" / "scenes" / "scene_01" / "profile.json").exists()
@@ -203,11 +278,15 @@ def test_vlm_client_payload_contains_frames_and_json_request(tmp_path: Path, mon
         transcript={"segments": [{"start": 0, "end": 1, "text": "hello"}]},
         video_duration=1,
         job_dir=tmp_path,
+        script_detail="detailed",
+        script_min_action_beats=2,
     )
 
     assert result == {"shots": []}
     assert captured["url"] == "https://ark/chat"
     assert captured["json"]["model"] == "vlm"
+    assert captured["json"]["max_tokens"] == 16000
+    assert captured["json"]["temperature"] == 0.1
     assert captured["json"]["response_format"] == {"type": "json_object"}
     content = captured["json"]["messages"][1]["content"]
     assert any(item.get("type") == "image_url" for item in content)

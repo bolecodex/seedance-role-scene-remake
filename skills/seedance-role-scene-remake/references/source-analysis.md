@@ -7,6 +7,7 @@
 - `analysis/analysis.json`：总分析结果，供 `prepare --analysis` 读取。
 - `analysis/script/剧本.md`：人工可读剧本，格式参考 `docs/剧本示例.md`。
 - `analysis/script/script.json`：结构化分场和 ASR 转写。
+- `analysis/script/script_quality.json`：剧本细节质量检查，标记动作节拍不足、情绪过抽象、环境或镜头信息不足。
 - `analysis/script/script_review.html`：分场、摘要和关键帧复核页。
 - `analysis/roles/index.html`：源角色人工检查总入口，每个角色一个独立文件夹。
 - `analysis/roles/{character_id}/profile.json`：源角色、人物裁剪、原始全帧、关联声音样本和对白转写汇总。
@@ -26,22 +27,23 @@
 
 ## 剧本格式
 
-剧本应按 `1-1 / 1-2...` 分场。每个分场包含：
+剧本应按 `1-1 / 1-2...` 分场。默认使用详细模式，每个分场包含：
 
-- 场景或动作叙述：例如 `全景-客厅内，男主站在门口。`
-- 景别/运镜 + 动作：例如 `近景-男主抬头看向女主。`
-- 对白：`角色（情绪）：“台词”`
+- 环境细节：写清可观察陈设、光线、空间层次和人物距离。
+- 镜头/运镜：写清景别、构图、移动或切换。
+- 动作节拍：写“谁做了什么”，至少包括手、脸、视线、身体或距离变化。
+- 对白：`角色（具体表情/视线/语气/姿态）：“台词”`
 - OS/旁白：`角色（OS）：“内心台词”` 或 `旁白：“内容”`
 - 音效：`音效：电话铃声`
 
-剧本只描述原片，不写目标替换设定。
+剧本只描述原片，不写目标替换设定。不要只写 `冷漠、强硬、平淡、大方、坚定、愤怒、疑惑、紧张、暧昧` 等抽象情绪词；应改成类似 `女主移开视线，嘴角压平，回答前停顿半拍` 的可观察状态。模型无法判断时留空，并由 `script_quality.json` 标记。
 
 ## JSON 关键字段
 
 `analysis.json` 至少包含：
 
 - `status`：`draft` 或 `reviewed`。
-- `shots[]`：`id/start/end/summary/description/camera/action/dialogues/evidence_paths/confidence`。
+- `shots[]`：`id/start/end/summary/description/environment_detail/camera_plan/action_beats/character_states/dialogues/evidence_paths/confidence`。
 - `characters[]`：机器可读的源角色候选，含 `id/name/description/evidence_paths/evidence_regions/confidence/confirmed`。其中 `evidence_paths` 是全帧证据，`evidence_regions` 是单人 bbox。
 - `scenes[]`：源场景候选，含 `id/name/description/evidence_paths/confidence/confirmed`。
 - `props[]`：源道具候选。

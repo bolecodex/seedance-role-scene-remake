@@ -156,6 +156,12 @@ def test_analyze_command_passes_options(tmp_path: Path, monkeypatch):
             "1.5",
             "--scene-threshold",
             "0.42",
+            "--script-detail",
+            "standard",
+            "--script-min-action-beats",
+            "3",
+            "--script-quality-json",
+            str(tmp_path / "quality.json"),
             "--allow-skeleton",
         ],
     )
@@ -165,6 +171,9 @@ def test_analyze_command_passes_options(tmp_path: Path, monkeypatch):
     assert calls["asr_model"] == "asr"
     assert calls["sample_seconds"] == 1.5
     assert calls["scene_threshold"] == 0.42
+    assert calls["script_detail"] == "standard"
+    assert calls["script_min_action_beats"] == 3
+    assert calls["script_quality_json"] == tmp_path / "quality.json"
     assert calls["allow_skeleton"] is True
 
 

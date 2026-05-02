@@ -128,6 +128,9 @@ def analyze(
     asr_model: str = typer.Option("", "--asr-model", help="临时指定 Ark/豆包 ASR 模型或接入点。"),
     sample_seconds: float = typer.Option(2.0, "--sample-seconds", help="密集抽帧间隔秒数。"),
     scene_threshold: float = typer.Option(0.35, "--scene-threshold", help="FFmpeg 镜头变化检测阈值。"),
+    script_detail: str = typer.Option("detailed", "--script-detail", help="剧本细节模式：standard 或 detailed。"),
+    script_min_action_beats: int = typer.Option(2, "--script-min-action-beats", help="每个分场至少需要的动作节拍数。"),
+    script_quality_json: Optional[Path] = typer.Option(None, "--script-quality-json", help="额外输出剧本质量检查 JSON。"),
     allow_skeleton: bool = typer.Option(False, "--allow-skeleton", help="缺少 Ark VLM/ASR 配置时仅输出本地骨架；默认禁止。"),
 ) -> None:
     """分析原视频，输出剧本和角色/场景/道具/声音源素材检查包。"""
@@ -139,6 +142,9 @@ def analyze(
         asr_model=asr_model,
         sample_seconds=sample_seconds,
         scene_threshold=scene_threshold,
+        script_detail=script_detail,
+        script_min_action_beats=script_min_action_beats,
+        script_quality_json=script_quality_json,
         allow_skeleton=allow_skeleton,
     )
 

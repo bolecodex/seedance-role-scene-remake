@@ -39,6 +39,37 @@ class AnalysisFrame:
     kind: str = "sample"
 
 
+ABSTRACT_EMOTION_WORDS = {
+    "冷漠",
+    "强硬",
+    "平淡",
+    "大方",
+    "坚定",
+    "愤怒",
+    "疑惑",
+    "开心",
+    "难过",
+    "紧张",
+    "暧昧",
+    "生气",
+    "伤心",
+    "高兴",
+    "害怕",
+    "惊讶",
+    "赞赏",
+    "欣赏",
+    "威胁",
+    "妥协",
+    "好奇",
+    "随意",
+    "坦然",
+    "冷淡",
+    "嚣张",
+    "不满",
+    "气愤",
+}
+
+
 class ArkASRClient:
     """Small OpenAI-style audio transcription adapter.
 
@@ -213,12 +244,28 @@ class ArkVLMClient:
         self.endpoint = endpoint
         self.timeout_s = timeout_s
 
-    def analyze(self, *, model: str, frames: list[AnalysisFrame], transcript: dict[str, Any], video_duration: float, job_dir: Path) -> dict[str, Any]:
+    def analyze(
+        self,
+        *,
+        model: str,
+        frames: list[AnalysisFrame],
+        transcript: dict[str, Any],
+        video_duration: float,
+        job_dir: Path,
+        script_detail: str,
+        script_min_action_beats: int,
+    ) -> dict[str, Any]:
         url = f"{self.base_url}{self.endpoint}"
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
-                "text": _analysis_prompt(frames=frames, transcript=transcript, duration=video_duration),
+                "text": _analysis_prompt(
+                    frames=frames,
+                    transcript=transcript,
+                    duration=video_duration,
+                    script_detail=script_detail,
+                    script_min_action_beats=script_min_action_beats,
+                ),
             }
         ]
         for frame in frames:
@@ -237,6 +284,8 @@ class ArkVLMClient:
                 },
                 {"role": "user", "content": content},
             ],
+            "temperature": 0.1,
+            "max_tokens": 16000,
             "response_format": {"type": "json_object"},
         }
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
@@ -266,6 +315,9 @@ def run_source_analysis(
     sample_seconds: float = 2.0,
     scene_threshold: float = 0.35,
     allow_skeleton: bool = False,
+    script_detail: str = "detailed",
+    script_min_action_beats: int = 2,
+    script_quality_json: Path | None = None,
 ) -> Path:
     if not video.exists():
         raise PipelineError(f"输入视频不存在：{video}")
@@ -284,6 +336,11 @@ def run_source_analysis(
             raise PipelineError("缺少原视频分析配置：" + "、".join(missing) + "。默认不输出低质量骨架；调试可加 --allow-skeleton。")
     if sample_seconds <= 0:
         raise PipelineError("--sample-seconds 必须大于 0。")
+    script_detail = (script_detail or "detailed").strip().lower()
+    if script_detail not in {"standard", "detailed"}:
+        raise PipelineError("--script-detail 必须是 standard 或 detailed。")
+    if script_min_action_beats < 0:
+        raise PipelineError("--script-min-action-beats 不能小于 0。")
 
     output.mkdir(parents=True, exist_ok=True)
     analysis_dir = output / "analysis"
@@ -322,7 +379,15 @@ def run_source_analysis(
             base_url=config.base_url,
             endpoint=config.analysis_endpoint,
             timeout_s=config.request_timeout_s,
-        ).analyze(model=analysis_model, frames=frames, transcript=transcript, video_duration=duration, job_dir=output)
+        ).analyze(
+            model=analysis_model,
+            frames=frames,
+            transcript=transcript,
+            video_duration=duration,
+            job_dir=output,
+            script_detail=script_detail,
+            script_min_action_beats=script_min_action_beats,
+        )
     elif allow_skeleton:
         raw = _skeleton_visual_analysis(frames=frames, transcript=transcript, duration=duration)
     else:
@@ -336,10 +401,15 @@ def run_source_analysis(
         transcript=transcript,
         duration=duration,
         backend="ark_vlm_asr" if analysis_model and asr_model else "local_skeleton",
+        script_detail=script_detail,
+        script_min_action_beats=script_min_action_beats,
     )
     _export_analysis_assets(payload, video=video, output=output)
     analysis_path = analysis_dir / "analysis.json"
     analysis_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if script_quality_json:
+        script_quality_json.parent.mkdir(parents=True, exist_ok=True)
+        script_quality_json.write_text(json.dumps(payload.get("script_quality") or {}, ensure_ascii=False, indent=2), encoding="utf-8")
     return analysis_path
 
 
@@ -356,6 +426,12 @@ def summarize_source_analysis(analysis_path: Path) -> list[str]:
     ]
     low = payload.get("low_confidence_items") or []
     review = payload.get("review_items") or []
+    script_quality = payload.get("script_quality") if isinstance(payload.get("script_quality"), dict) else {}
+    script_issues = script_quality.get("issues") if isinstance(script_quality.get("issues"), list) else []
+    if script_issues:
+        shot_ids = sorted({str(item.get("shot_id") or "") for item in script_issues if isinstance(item, dict) and item.get("shot_id")})
+        suffix = f"（涉及分场：{', '.join(shot_ids[:8])}）" if shot_ids else ""
+        lines.append(f"剧本质量问题：{len(script_issues)}{suffix}")
     if low:
         lines.append(f"低置信度项：{len(low)}")
     if review:
@@ -416,6 +492,7 @@ def source_analysis_spec(payload: dict[str, Any], *, analysis_path: Path, job_di
         analysis_json_path=_relative(analysis_path, job_dir),
         script_path=payload.get("script_path"),
         script_json_path=payload.get("script_json_path"),
+        script_quality_path=payload.get("script_quality_path"),
         index_path=payload.get("index_path"),
         character_index=_index_entries(payload.get("characters") or []),
         scene_index=_index_entries(payload.get("scenes") or []),
@@ -434,15 +511,44 @@ def format_script_markdown(payload: dict[str, Any]) -> str:
             continue
         shot_id = str(shot.get("id") or f"1-{index}")
         lines.append(shot_id)
-        scene_text = str(shot.get("scene_description") or shot.get("description") or shot.get("summary") or "请人工补充画面内容。").strip()
+        scene_text = str(shot.get("environment_detail") or shot.get("scene_description") or shot.get("description") or shot.get("summary") or "请人工补充画面内容。").strip()
         if scene_text:
             lines.append(scene_text)
-        camera = str(shot.get("camera") or "").strip()
-        action = str(shot.get("action") or "").strip()
-        if camera and action:
-            lines.append(f"{camera}-{action}")
-        elif action:
-            lines.append(action)
+        camera_plan = shot.get("camera_plan") if isinstance(shot.get("camera_plan"), list) else []
+        if camera_plan:
+            for item in camera_plan:
+                text = str(item).strip()
+                if text:
+                    lines.append(f"镜头/运镜：{text}")
+        else:
+            camera = str(shot.get("camera") or "").strip()
+            action = str(shot.get("action") or "").strip()
+            if camera and action:
+                lines.append(f"{camera}-{action}")
+            elif action:
+                lines.append(action)
+        action_beats = shot.get("action_beats") if isinstance(shot.get("action_beats"), list) else []
+        for beat in action_beats:
+            if not isinstance(beat, dict):
+                continue
+            actor = str(beat.get("actor") or "").strip()
+            description = str(beat.get("description") or "").strip()
+            timing = str(beat.get("timing") or "").strip()
+            camera = str(beat.get("camera") or "").strip()
+            if not description:
+                continue
+            prefix = f"{actor}：" if actor else ""
+            suffix_parts = [item for item in [timing, camera] if item]
+            suffix = f"（{'，'.join(suffix_parts)}）" if suffix_parts else ""
+            lines.append(f"动作：{prefix}{description}{suffix}")
+        character_states = shot.get("character_states") if isinstance(shot.get("character_states"), list) else []
+        for state in character_states:
+            if not isinstance(state, dict):
+                continue
+            character = str(state.get("character") or "").strip()
+            text = str(state.get("state") or "").strip()
+            if text:
+                lines.append(f"状态：{character + '：' if character else ''}{text}")
         for dialogue in shot.get("dialogues") or []:
             if not isinstance(dialogue, dict):
                 continue
@@ -450,12 +556,15 @@ def format_script_markdown(payload: dict[str, Any]) -> str:
             text = str(dialogue.get("text") or "").strip()
             if not text:
                 continue
+            state_text = _dialogue_state_text(dialogue)
             emotion = str(dialogue.get("emotion") or dialogue.get("tone") or "").strip()
             kind = str(dialogue.get("type") or "dialogue").lower()
             prefix = "旁白" if kind in {"narration", "voiceover"} else speaker
             if kind == "os":
                 prefix = f"{speaker}（OS）"
-            elif emotion and prefix != "旁白":
+            elif state_text and prefix != "旁白":
+                prefix = f"{speaker}（{state_text}）"
+            elif emotion and prefix != "旁白" and not _is_abstract_emotion(emotion):
                 prefix = f"{speaker}（{emotion}）"
             lines.append(f"{prefix}：“{text}”")
         for sound in shot.get("sounds") or []:
@@ -464,6 +573,94 @@ def format_script_markdown(payload: dict[str, Any]) -> str:
                 lines.append(f"音效：{value}")
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def analyze_script_quality(payload: dict[str, Any], *, min_action_beats: int = 2) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    for shot_index, shot in enumerate(payload.get("shots") or [], start=1):
+        if not isinstance(shot, dict):
+            continue
+        shot_id = str(shot.get("id") or f"1-{shot_index}")
+        action_beats = [item for item in shot.get("action_beats") or [] if isinstance(item, dict) and str(item.get("description") or "").strip()]
+        fallback_action = str(shot.get("action") or "").strip()
+        if len(action_beats) < min_action_beats and not (fallback_action and min_action_beats <= 1):
+            issues.append(
+                {
+                    "type": "insufficient_action_beats",
+                    "shot_id": shot_id,
+                    "message": f"动作节拍不足：当前 {len(action_beats)} 条，目标至少 {min_action_beats} 条。",
+                }
+            )
+        environment = str(shot.get("environment_detail") or shot.get("scene_description") or "").strip()
+        if len(environment) < 18:
+            issues.append({"type": "thin_environment_detail", "shot_id": shot_id, "message": "环境描写过短，缺少可观察陈设、光线或空间关系。"})
+        camera_plan = shot.get("camera_plan") if isinstance(shot.get("camera_plan"), list) else []
+        camera_text = " ".join(str(item) for item in camera_plan) or str(shot.get("camera") or "")
+        if not _has_camera_specificity(camera_text):
+            issues.append({"type": "thin_camera_plan", "shot_id": shot_id, "message": "镜头描述缺少景别、运镜或切换信息。"})
+        for dialogue_index, dialogue in enumerate(shot.get("dialogues") or []):
+            if not isinstance(dialogue, dict):
+                continue
+            emotion = str(dialogue.get("emotion") or dialogue.get("tone") or "").strip()
+            if emotion and _is_abstract_emotion(emotion) and not _dialogue_state_parts(dialogue):
+                issues.append(
+                    {
+                        "type": "abstract_emotion",
+                        "shot_id": shot_id,
+                        "dialogue_index": dialogue_index,
+                        "speaker": dialogue.get("speaker") or dialogue.get("character_id") or "",
+                        "text": dialogue.get("text") or "",
+                        "emotion": emotion,
+                        "message": "对白只给了抽象情绪词，缺少表情、视线、语气、停顿、身体姿态或手部动作。",
+                    }
+                )
+            state_text = _dialogue_state_text(dialogue)
+            if state_text:
+                abstract_words = sorted({word for word in ABSTRACT_EMOTION_WORDS if word in state_text})
+                if abstract_words:
+                    issues.append(
+                        {
+                            "type": "abstract_state_detail",
+                            "shot_id": shot_id,
+                            "dialogue_index": dialogue_index,
+                            "speaker": dialogue.get("speaker") or dialogue.get("character_id") or "",
+                            "text": dialogue.get("text") or "",
+                            "abstract_words": abstract_words,
+                            "message": "对白状态中仍包含抽象情绪词，建议替换为可观察表情、视线、语气、停顿、姿态或动作。",
+                        }
+                    )
+    return {
+        "version": 1,
+        "issue_count": len(issues),
+        "issues": issues,
+        "weak_emotion_words": sorted(ABSTRACT_EMOTION_WORDS),
+    }
+
+
+def _dialogue_state_text(dialogue: dict[str, Any]) -> str:
+    return "，".join(_dialogue_state_parts(dialogue))
+
+
+def _dialogue_state_parts(dialogue: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    for key in ["delivery", "facial_expression", "body_language", "gaze", "pause", "subtext"]:
+        value = str(dialogue.get(key) or "").strip()
+        if value:
+            parts.append(value)
+    return parts
+
+
+def _is_abstract_emotion(value: str) -> bool:
+    text = value.strip()
+    return text in ABSTRACT_EMOTION_WORDS or any(word in text for word in ABSTRACT_EMOTION_WORDS)
+
+
+def _has_camera_specificity(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    keywords = ["全景", "中景", "近景", "特写", "推", "拉", "摇", "移", "跟", "切", "硬切", "镜头", "运镜", "俯拍", "仰拍"]
+    return any(keyword in text for keyword in keywords)
 
 
 def _extract_analysis_frames(video: Path, *, frames_dir: Path, job_dir: Path, sample_seconds: float, scene_threshold: float) -> list[AnalysisFrame]:
@@ -499,6 +696,8 @@ def _normalize_analysis(
     transcript: dict[str, Any],
     duration: float,
     backend: str,
+    script_detail: str = "detailed",
+    script_min_action_beats: int = 2,
 ) -> dict[str, Any]:
     transcript_items = _normalize_transcript(transcript)
     shots = _normalize_shots(raw.get("shots") or raw.get("scenes") or raw.get("segments"), frames=frames, transcript=transcript_items, duration=duration)
@@ -509,12 +708,14 @@ def _normalize_analysis(
     props = _normalize_entities(raw.get("props") or raw.get("objects"), prefix="prop", default_name="未知道具", frames=frames)
     voices = _normalize_voices(raw.get("voices") or raw.get("speakers"), transcript_items=transcript_items)
     _attach_dialogue_voice_samples(voices=voices, shots=shots, transcript_items=transcript_items, characters=characters)
+    script_quality = analyze_script_quality({"shots": shots}, min_action_beats=script_min_action_beats)
     review_items = _review_items(characters=characters, scenes=scenes, props=props, voices=voices, shots=shots)
     low_confidence = _low_confidence_items(characters + scenes + props + voices + shots)
     payload: dict[str, Any] = {
         "version": 1,
         "status": "draft" if review_items or low_confidence else "reviewed",
         "backend": backend,
+        "script_detail": script_detail,
         "source": str(source.resolve()),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "duration": duration,
@@ -526,6 +727,7 @@ def _normalize_analysis(
         "scenes": scenes,
         "props": props,
         "voices": voices,
+        "script_quality": script_quality,
         "low_confidence_items": low_confidence,
         "review_items": review_items,
     }
@@ -533,6 +735,7 @@ def _normalize_analysis(
     payload["script_path"] = _relative(script_dir / "剧本.md", output)
     payload["script_json_path"] = _relative(script_dir / "script.json", output)
     payload["script_review_path"] = _relative(script_dir / "script_review.html", output)
+    payload["script_quality_path"] = _relative(script_dir / "script_quality.json", output)
     payload["roles_index_path"] = _relative(output / "analysis" / "roles" / "index.html", output)
     payload["index_path"] = _relative(output / "analysis" / "index.html", output)
     return payload
@@ -544,6 +747,7 @@ def _export_analysis_assets(payload: dict[str, Any], *, video: Path, output: Pat
     script_dir.mkdir(parents=True, exist_ok=True)
     (output / payload["script_path"]).write_text(format_script_markdown(payload), encoding="utf-8")
     (output / payload["script_json_path"]).write_text(json.dumps({"shots": payload["shots"], "transcript": payload["transcript"]}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output / payload["script_quality_path"]).write_text(json.dumps(payload.get("script_quality") or {}, ensure_ascii=False, indent=2), encoding="utf-8")
     _write_script_review(payload, output / payload["script_review_path"], job_dir=output)
     _write_entity_profiles(payload, kind="characters", output=output)
     _write_entity_profiles(payload, kind="scenes", output=output, evidence_subdir="keyframes")
@@ -802,6 +1006,11 @@ def _write_entity_contact_sheet(item: dict[str, Any], output: Path, *, job_dir: 
 
 def _write_script_review(payload: dict[str, Any], output: Path, *, job_dir: Path) -> None:
     rows = []
+    issues_by_shot: dict[str, list[dict[str, Any]]] = {}
+    script_quality = payload.get("script_quality") if isinstance(payload.get("script_quality"), dict) else {}
+    for issue in script_quality.get("issues") or []:
+        if isinstance(issue, dict):
+            issues_by_shot.setdefault(str(issue.get("shot_id") or ""), []).append(issue)
     for shot in payload.get("shots") or []:
         if not isinstance(shot, dict):
             continue
@@ -810,17 +1019,19 @@ def _write_script_review(payload: dict[str, Any], output: Path, *, job_dir: Path
             frames.append(f'<img src="{html.escape(_html_rel(output.parent, job_dir / rel))}" alt="{html.escape(rel)}">')
         start = float(shot.get("start") or 0)
         end = float(shot.get("end") or 0)
+        issue_items = "".join(f"<li>{html.escape(str(item.get('type') or 'issue'))}：{html.escape(str(item.get('message') or ''))}</li>" for item in issues_by_shot.get(str(shot.get("id") or ""), []))
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(shot.get('id') or ''))}</td>"
             f"<td>{start:.2f}-{end:.2f}s</td>"
             f"<td>{html.escape(str(shot.get('summary') or shot.get('description') or ''))}</td>"
+            f"<td><ul>{issue_items or '<li>无</li>'}</ul></td>"
             f"<td>{''.join(frames)}</td>"
             "</tr>"
         )
     output.write_text(
         f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}img{{width:160px;margin:3px}}</style></head><body>
-<h1>剧本复核</h1><table><thead><tr><th>分场</th><th>时间</th><th>摘要</th><th>关键帧</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
+<h1>剧本复核</h1><p>剧本质量问题：{html.escape(str(script_quality.get('issue_count', 0)))}</p><table><thead><tr><th>分场</th><th>时间</th><th>摘要</th><th>剧本问题</th><th>关键帧</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
 </body></html>""",
         encoding="utf-8",
     )
@@ -830,6 +1041,7 @@ def _write_index(payload: dict[str, Any], output: Path, *, job_dir: Path) -> Non
     links = [
         ("剧本", payload.get("script_path")),
         ("剧本复核", payload.get("script_review_path")),
+        ("剧本质量 JSON", payload.get("script_quality_path")),
         ("源角色人工检查", payload.get("roles_index_path")),
     ]
     cards = []
@@ -892,8 +1104,12 @@ def _normalize_shots(items: Any, *, frames: list[AnalysisFrame], transcript: lis
                 "summary": str(item.get("summary") or item.get("description") or "").strip(),
                 "description": str(item.get("description") or item.get("summary") or "").strip(),
                 "scene_description": str(item.get("scene_description") or item.get("environment") or "").strip(),
+                "environment_detail": str(item.get("environment_detail") or item.get("environment_details") or "").strip(),
                 "camera": str(item.get("camera") or item.get("shot_size") or "").strip(),
+                "camera_plan": _normalize_text_items(item.get("camera_plan") or item.get("camera_beats")),
                 "action": str(item.get("action") or item.get("actions") or "").strip(),
+                "action_beats": _normalize_action_beats(item.get("action_beats") or item.get("beats")),
+                "character_states": _normalize_character_states(item.get("character_states") or item.get("states")),
                 "character_ids": _safe_id_list(item.get("character_ids") or []),
                 "scene_id": _safe_optional_id(item.get("scene_id")),
                 "prop_ids": _safe_id_list(item.get("prop_ids") or []),
@@ -930,6 +1146,61 @@ def _normalize_entities(items: Any, *, prefix: str, default_name: str, frames: l
                 "evidence_regions": _normalize_evidence_regions(item, frames=frames),
             }
         )
+    return result
+
+
+def _normalize_text_items(items: Any) -> list[str]:
+    if isinstance(items, str):
+        text = items.strip()
+        return [text] if text else []
+    if not isinstance(items, list):
+        return []
+    result: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            text = str(item.get("description") or item.get("text") or item.get("value") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text:
+            result.append(text)
+    return result
+
+
+def _normalize_action_beats(items: Any) -> list[dict[str, Any]]:
+    if isinstance(items, str):
+        text = items.strip()
+        return [{"description": text}] if text else []
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, dict):
+            description = str(item.get("description") or item.get("action") or item.get("text") or "").strip()
+            actor = str(item.get("actor") or item.get("character") or "").strip()
+            timing = str(item.get("timing") or item.get("time") or item.get("timestamp") or "").strip()
+            camera = str(item.get("camera") or "").strip()
+        else:
+            description = str(item or "").strip()
+            actor = ""
+            timing = ""
+            camera = ""
+        if description:
+            result.append({"index": index, "actor": actor, "description": description, "timing": timing, "camera": camera})
+    return result
+
+
+def _normalize_character_states(items: Any) -> list[dict[str, str]]:
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        character = str(item.get("character") or item.get("character_id") or item.get("name") or "").strip()
+        details = _dialogue_state_parts(item)
+        state = "，".join(details)
+        if character or state:
+            result.append({"character": character, "state": state})
     return result
 
 
@@ -1279,8 +1550,12 @@ def _skeleton_shots(*, frames: list[AnalysisFrame], transcript: list[dict[str, A
                 "summary": "请人工补充该分场剧情。",
                 "description": "全景-请人工检查画面人物、动作、场景和道具。",
                 "scene_description": "请人工补充场景环境。",
+                "environment_detail": "请人工补充可观察的空间陈设、光线、人物距离和画面层次。",
                 "camera": "全景",
+                "camera_plan": ["全景建立空间关系，请人工补充后续景别和运镜。"],
                 "action": "请人工补充动作。",
+                "action_beats": [{"index": 1, "description": "请人工补充可观察动作。"}],
+                "character_states": [],
                 "dialogues": _dialogues_in_range(transcript, start, end),
                 "sounds": [],
                 "confidence": 0.3,
@@ -1291,26 +1566,37 @@ def _skeleton_shots(*, frames: list[AnalysisFrame], transcript: list[dict[str, A
     return shots
 
 
-def _analysis_prompt(*, frames: list[AnalysisFrame], transcript: dict[str, Any], duration: float) -> str:
+def _analysis_prompt(*, frames: list[AnalysisFrame], transcript: dict[str, Any], duration: float, script_detail: str, script_min_action_beats: int) -> str:
     frame_lines = "\n".join(f"- {frame.id}: {frame.timestamp:.2f}s, path={frame.path}" for frame in frames)
     transcript_text = json.dumps(_normalize_transcript(transcript), ensure_ascii=False)
+    detail_rules = (
+        f"详细剧本模式：每个 shots[] 至少给出 {script_min_action_beats} 条 action_beats；动作必须是画面可观察动作，情绪必须落到表情、视线、语气、停顿、身体姿态、手部动作或人物距离变化。"
+        if script_detail == "detailed"
+        else "标准剧本模式：保持简洁，但仍优先使用可观察动作和具体对白状态。"
+    )
     return f"""请分析一个短剧原视频，把它转为可供视频换角色/换场景前置检查使用的结构化 JSON。
 视频总时长：{duration:.2f}s。
 关键帧列表：
 {frame_lines}
 ASR 转写候选：
 {transcript_text}
+{detail_rules}
 
 只输出 JSON，字段如下：
 {{
   "synopsis": "全片剧情摘要",
-  "shots": [{{"id":"1-1","start":0,"end":2.0,"summary":"","description":"","scene_description":"","camera":"近景/中景/全景/特写","action":"","character_ids":[],"scene_id":"","prop_ids":[],"dialogues":[{{"speaker":"","text":"","emotion":"","type":"dialogue/os/narration"}}],"sounds":[],"confidence":0.0,"evidence_paths":[]}}],
+  "shots": [{{"id":"1-1","start":0,"end":2.0,"summary":"","description":"","scene_description":"","environment_detail":"具体空间、陈设、光线、人物距离和画面层次","camera":"近景/中景/全景/特写","camera_plan":["景别、运镜、切换和构图变化"],"action":"旧版简短动作","action_beats":[{{"actor":"","description":"可观察动作，不写抽象情绪","timing":"可选时间/先后","camera":"可选对应镜头"}}],"character_states":[{{"character":"","facial_expression":"","body_language":"","gaze":"","delivery":"","pause":""}}],"character_ids":[],"scene_id":"","prop_ids":[],"dialogues":[{{"speaker":"","text":"","emotion":"","delivery":"具体语气","facial_expression":"具体表情","body_language":"身体姿态或手部动作","gaze":"视线方向","pause":"停顿/抢话/压低声音等节奏","subtext":"可从画面和对白判断的潜台词","type":"dialogue/os/narration"}}],"sounds":[],"confidence":0.0,"evidence_paths":[]}}],
   "characters": [{{"id":"","name":"","description":"","evidence_timestamps":[],"evidence_regions":[{{"frame_id":"frame_0000","timestamp":0.0,"bbox":[x,y,w,h],"note":"单个角色可见区域"}}],"confidence":0.0,"confirmed":false}}],
   "source_scenes": [{{"id":"","name":"","description":"","evidence_timestamps":[],"confidence":0.0,"confirmed":false}}],
   "props": [{{"id":"","name":"","description":"","evidence_timestamps":[],"confidence":0.0,"confirmed":false}}],
   "voices": [{{"id":"","name":"","description":"","character_id":"","speaker":"","confidence":0.0,"confirmed":false}}]
 }}
-要求：剧本分场接近“1-1/1-2”格式；角色、场景、道具必须便于人工复核；characters.evidence_regions 必须尽量给出单个角色在关键帧中的 bbox，坐标以关键帧图片像素为准，不要用整帧 bbox 代替单人框；不要把目标替换设定写入这里，只描述原视频。"""
+要求：
+- 剧本分场接近“1-1/1-2”格式；角色、场景、道具必须便于人工复核。
+- 不要只写“冷漠、强硬、平淡、大方、坚定、愤怒、疑惑、开心、难过、紧张、暧昧”等抽象词；若无法判断具体细节，字段留空，不要编造。
+- 动作描写写“谁做了什么、手/脸/视线/身体/距离如何变化”，不要只写“发生争执、二人对话、气氛暧昧”。
+- characters.evidence_regions 必须尽量给出单个角色在关键帧中的 bbox，坐标以关键帧图片像素为准，不要用整帧 bbox 代替单人框。
+- 不要把目标替换设定写入这里，只描述原视频。"""
 
 
 def _dialogues_in_range(transcript: list[dict[str, Any]], start: float, end: float) -> list[dict[str, Any]]:

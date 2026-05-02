@@ -291,6 +291,9 @@ def analyze_job(
     asr_model: str = "",
     sample_seconds: float = 2.0,
     scene_threshold: float = 0.35,
+    script_detail: str = "detailed",
+    script_min_action_beats: int = 2,
+    script_quality_json: Path | None = None,
     allow_skeleton: bool = False,
 ) -> Path:
     analysis_path = run_source_analysis(
@@ -301,6 +304,9 @@ def analyze_job(
         asr_model=asr_model,
         sample_seconds=sample_seconds,
         scene_threshold=scene_threshold,
+        script_detail=script_detail,
+        script_min_action_beats=script_min_action_beats,
+        script_quality_json=script_quality_json,
         allow_skeleton=allow_skeleton,
     )
     typer.echo(f"原视频分析已保存：{analysis_path}")

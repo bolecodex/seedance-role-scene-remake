@@ -47,7 +47,9 @@ TOS_BUCKET="..."
 ```bash
 seedance-role-scene-remake analyze ./input.mp4 -o ./job_remake \
   --sample-seconds 2 \
-  --scene-threshold 0.35
+  --scene-threshold 0.35 \
+  --script-detail detailed \
+  --script-min-action-beats 2
 
 seedance-role-scene-remake analyze-manifest ./job_remake/analysis/analysis.json
 ```
@@ -55,11 +57,14 @@ seedance-role-scene-remake analyze-manifest ./job_remake/analysis/analysis.json
 重点打开 `job_remake/analysis/index.html` 检查：
 
 - `analysis/script/剧本.md`：按 `1-1 / 1-2...` 分场的原片剧本。
+- `analysis/script/script_quality.json`：剧本细节质量检查；若动作节拍不足或情绪只写抽象词，先复核这一项。
 - `analysis/roles/index.html`：源角色人工检查入口，每个角色一个独立文件夹，集中展示 `person_crops` 单人裁剪、`full_frames` 原始全帧、声音样本和对白转写。
 - `analysis/characters/{character_id}/`：源角色 profile、证据帧和联系表。
 - `analysis/scenes/{scene_id}/`：源场景 profile、关键帧和联系表。
 - `analysis/props/{prop_id}/`：源道具 profile 和证据帧。
 - `analysis/voices/{voice_id}/`：源角色声音样本和转写片段。
+
+剧本检查时，不要接受只写“冷漠、强硬、平淡、坚定、暧昧”的抽象情绪；优先要求“女主移开视线，嘴角压平，回答前停顿半拍”这类可观察状态。
 
 人工检查后，将分析 JSON 或后续 manifest 中的 `source_analysis.status` 标为 `reviewed`，并清空已处理的低置信度/待检查项。再生成目标设定草稿：
 

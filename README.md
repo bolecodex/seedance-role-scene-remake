@@ -125,7 +125,9 @@ seedance-role-scene-remake analyze ./video/input.mp4 \
   --analysis-model "$SEEDANCE_ROLE_SCENE_ANALYSIS_MODEL" \
   --asr-model doubao_streaming_2.0 \
   --sample-seconds 2 \
-  --scene-threshold 0.35
+  --scene-threshold 0.35 \
+  --script-detail detailed \
+  --script-min-action-beats 2
 ```
 
 查看检查清单：
@@ -139,10 +141,13 @@ seedance-role-scene-remake analyze-manifest ./job_input_analysis/analysis/analys
 - `job_input_analysis/analysis/index.html`
 - `job_input_analysis/analysis/roles/index.html`
 - `job_input_analysis/analysis/script/剧本.md`
+- `job_input_analysis/analysis/script/script_quality.json`
 - `job_input_analysis/analysis/characters/`
 - `job_input_analysis/analysis/scenes/`
 - `job_input_analysis/analysis/props/`
 - `job_input_analysis/analysis/voices/`
+
+剧本检查重点：动作和情绪要可观察。不要只写“女主冷淡”或“男主强硬”，应尽量写成“女主移开视线，嘴角压平，回答前停顿半拍”或“男主下巴微收，压低声音，视线没有离开对方”。无法判断的细节会在 `script_quality.json` 中标记，供人工复核。
 
 ### 2. 准备目标设定
 
@@ -260,6 +265,7 @@ seedance-role-scene-remake merge ./job_input_remake/manifest.json -o ./final_inp
 ```text
 analysis/                         原视频分析和人工检查包
 analysis/script/剧本.md            中文剧本
+analysis/script/script_quality.json 剧本细节质量检查
 analysis/roles/                   源角色人工检查包，每个角色一个独立文件夹
 analysis/roles/*/person_crops/    bbox 裁出的单角色截图
 analysis/roles/*/full_frames/     原始全帧证据，可能包含其他人物

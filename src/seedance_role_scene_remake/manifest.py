@@ -46,6 +46,7 @@ class SourceAnalysisSpec:
     analysis_json_path: str | None = None
     script_path: str | None = None
     script_json_path: str | None = None
+    script_quality_path: str | None = None
     index_path: str | None = None
     character_index: list[dict[str, Any]] = field(default_factory=list)
     scene_index: list[dict[str, Any]] = field(default_factory=list)
