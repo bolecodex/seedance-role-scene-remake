@@ -137,6 +137,7 @@ seedance-role-scene-remake analyze-manifest ./job_input_analysis/analysis/analys
 重点打开：
 
 - `job_input_analysis/analysis/index.html`
+- `job_input_analysis/analysis/roles/index.html`
 - `job_input_analysis/analysis/script/剧本.md`
 - `job_input_analysis/analysis/characters/`
 - `job_input_analysis/analysis/scenes/`
@@ -259,6 +260,7 @@ seedance-role-scene-remake merge ./job_input_remake/manifest.json -o ./final_inp
 ```text
 analysis/                         原视频分析和人工检查包
 analysis/script/剧本.md            中文剧本
+analysis/roles/                   源角色人工检查包，每个角色一个独立文件夹
 analysis/characters/              源角色证据
 analysis/scenes/                  源场景证据
 analysis/props/                   源道具证据

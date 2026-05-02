@@ -55,6 +55,7 @@ seedance-role-scene-remake analyze-manifest ./job_remake/analysis/analysis.json
 重点打开 `job_remake/analysis/index.html` 检查：
 
 - `analysis/script/剧本.md`：按 `1-1 / 1-2...` 分场的原片剧本。
+- `analysis/roles/index.html`：源角色人工检查入口，每个角色一个独立文件夹，集中展示证据帧、声音样本和对白转写。
 - `analysis/characters/{character_id}/`：源角色 profile、证据帧和联系表。
 - `analysis/scenes/{scene_id}/`：源场景 profile、关键帧和联系表。
 - `analysis/props/{prop_id}/`：源道具 profile 和证据帧。

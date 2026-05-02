@@ -89,8 +89,54 @@ def test_run_source_analysis_allow_skeleton_exports_review_package(tmp_path: Pat
     assert (tmp_path / "job" / "analysis" / "script" / "剧本.md").exists()
     assert (tmp_path / "job" / "analysis" / "script" / "script.json").exists()
     assert (tmp_path / "job" / "analysis" / "index.html").exists()
+    assert (tmp_path / "job" / "analysis" / "roles" / "index.html").exists()
     assert (tmp_path / "job" / "analysis" / "scenes" / "scene_01" / "profile.json").exists()
     assert any("分场" in line for line in summarize_source_analysis(analysis_path))
+
+
+def test_role_review_package_groups_character_evidence_and_voice_samples(tmp_path: Path):
+    from seedance_role_scene_remake.analysis import _write_role_review_package
+
+    job = tmp_path / "job"
+    image = job / "analysis" / "characters" / "char_001" / "evidence" / "frame.jpg"
+    audio = job / "analysis" / "voices" / "voice_001" / "samples" / "sample.m4a"
+    image.parent.mkdir(parents=True)
+    audio.parent.mkdir(parents=True)
+    image.write_bytes(b"jpg")
+    audio.write_bytes(b"audio")
+    payload = {
+        "characters": [
+            {
+                "id": "char_001",
+                "name": "男主",
+                "description": "源视频男主。",
+                "confidence": 0.95,
+                "confirmed": False,
+                "profile_path": "analysis/characters/char_001/profile.json",
+                "evidence_paths": ["analysis/characters/char_001/evidence/frame.jpg"],
+            }
+        ],
+        "voices": [
+            {
+                "id": "voice_001",
+                "name": "男主声音",
+                "character_id": "char_001",
+                "confidence": 0.8,
+                "profile_path": "analysis/voices/voice_001/profile.json",
+                "sample_paths": ["analysis/voices/voice_001/samples/sample.m4a"],
+                "transcript_segments": [{"start": 0.0, "end": 1.0, "text": "hello"}],
+            }
+        ],
+    }
+
+    _write_role_review_package(payload, output=job)
+
+    assert (job / "analysis" / "roles" / "index.html").exists()
+    assert (job / "analysis" / "roles" / "char_001" / "profile.json").exists()
+    assert (job / "analysis" / "roles" / "char_001" / "contact_sheet.html").exists()
+    assert (job / "analysis" / "roles" / "char_001" / "evidence" / "frame.jpg").exists()
+    assert (job / "analysis" / "roles" / "char_001" / "voice_samples" / "sample.m4a").exists()
+    assert payload["characters"][0]["role_review_path"] == "analysis/roles/char_001/contact_sheet.html"
 
 
 def test_vlm_client_payload_contains_frames_and_json_request(tmp_path: Path, monkeypatch):

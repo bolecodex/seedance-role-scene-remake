@@ -8,6 +8,11 @@
 - `analysis/script/剧本.md`：人工可读剧本，格式参考 `docs/剧本示例.md`。
 - `analysis/script/script.json`：结构化分场和 ASR 转写。
 - `analysis/script/script_review.html`：分场、摘要和关键帧复核页。
+- `analysis/roles/index.html`：源角色人工检查总入口，每个角色一个独立文件夹。
+- `analysis/roles/{character_id}/profile.json`：源角色、证据帧、关联声音样本和对白转写汇总。
+- `analysis/roles/{character_id}/evidence/`：该角色证据帧副本，方便人工集中检查。
+- `analysis/roles/{character_id}/voice_samples/`：该角色关联声音样本副本。
+- `analysis/roles/{character_id}/contact_sheet.html`：该角色独立检查页。
 - `analysis/characters/{character_id}/profile.json`：源角色描述、置信度、确认状态和证据帧。
 - `analysis/characters/{character_id}/evidence/`：源角色证据帧。
 - `analysis/scenes/{scene_id}/profile.json`：源场景描述、置信度、确认状态和关键帧。
@@ -48,6 +53,7 @@
 ## 使用原则
 
 - 源角色、源场景、源道具和源声音只用于理解原片和人工检查。
+- 人工检查角色时优先打开 `analysis/roles/index.html`，它把每个角色的证据帧和声音样本集中到独立文件夹。
 - 目标角色外观仍放在 `target_refs/characters/`。
 - 目标场景外观仍放在 `target_refs/scenes/`。
 - 源声音样本可作为声音一致性检查材料；如果模型不支持音频参考，不能伪装为已使用音色参考。

@@ -532,6 +532,7 @@ def _normalize_analysis(
     payload["script_path"] = _relative(script_dir / "剧本.md", output)
     payload["script_json_path"] = _relative(script_dir / "script.json", output)
     payload["script_review_path"] = _relative(script_dir / "script_review.html", output)
+    payload["roles_index_path"] = _relative(output / "analysis" / "roles" / "index.html", output)
     payload["index_path"] = _relative(output / "analysis" / "index.html", output)
     return payload
 
@@ -547,6 +548,7 @@ def _export_analysis_assets(payload: dict[str, Any], *, video: Path, output: Pat
     _write_entity_profiles(payload, kind="scenes", output=output, evidence_subdir="keyframes")
     _write_entity_profiles(payload, kind="props", output=output)
     _write_voice_profiles(payload, video=video, output=output)
+    _write_role_review_package(payload, output=output)
     _write_index(payload, output / payload["index_path"], job_dir=output)
 
 
@@ -596,6 +598,159 @@ def _write_voice_profiles(payload: dict[str, Any], *, video: Path, output: Path)
         (base / "transcript.json").write_text(json.dumps({"segments": item.get("transcript_segments") or []}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_role_review_package(payload: dict[str, Any], *, output: Path) -> None:
+    roles_dir = output / "analysis" / "roles"
+    roles_dir.mkdir(parents=True, exist_ok=True)
+    voices_by_character: dict[str, list[dict[str, Any]]] = {}
+    for voice in payload.get("voices") or []:
+        if not isinstance(voice, dict):
+            continue
+        character_id = _safe_optional_id(voice.get("character_id"))
+        if character_id:
+            voices_by_character.setdefault(character_id, []).append(voice)
+
+    role_cards: list[dict[str, Any]] = []
+    for character in payload.get("characters") or []:
+        if not isinstance(character, dict):
+            continue
+        role_id = _safe_id(str(character.get("id") or "role"))
+        base = roles_dir / role_id
+        evidence_dir = base / "evidence"
+        samples_dir = base / "voice_samples"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        samples_dir.mkdir(parents=True, exist_ok=True)
+
+        evidence_paths: list[str] = []
+        seen_evidence: set[str] = set()
+        for rel in character.get("evidence_paths") or []:
+            copied = _copy_analysis_asset(output / rel, evidence_dir, output)
+            if copied and copied not in seen_evidence:
+                seen_evidence.add(copied)
+                evidence_paths.append(copied)
+
+        role_voices: list[dict[str, Any]] = []
+        for voice in voices_by_character.get(role_id, []):
+            sample_paths: list[str] = []
+            seen_samples: set[str] = set()
+            for rel in voice.get("sample_paths") or []:
+                copied = _copy_analysis_asset(output / rel, samples_dir, output)
+                if copied and copied not in seen_samples:
+                    seen_samples.add(copied)
+                    sample_paths.append(copied)
+            role_voices.append(
+                {
+                    "id": voice.get("id"),
+                    "name": voice.get("name"),
+                    "description": voice.get("description"),
+                    "confidence": voice.get("confidence"),
+                    "confirmed": voice.get("confirmed", False),
+                    "profile_path": voice.get("profile_path"),
+                    "sample_paths": sample_paths,
+                    "transcript_segments": voice.get("transcript_segments") or [],
+                }
+            )
+
+        role_payload = {
+            "id": role_id,
+            "name": character.get("name"),
+            "description": character.get("description"),
+            "confidence": character.get("confidence"),
+            "confirmed": character.get("confirmed", False),
+            "source_character_profile": character.get("profile_path"),
+            "evidence_paths": evidence_paths,
+            "voices": role_voices,
+        }
+        role_payload["profile_path"] = _relative(base / "profile.json", output)
+        role_payload["contact_sheet_path"] = _relative(base / "contact_sheet.html", output)
+        character["role_profile_path"] = role_payload["profile_path"]
+        character["role_review_path"] = role_payload["contact_sheet_path"]
+        (base / "profile.json").write_text(json.dumps(role_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_role_contact_sheet(role_payload, base / "contact_sheet.html", job_dir=output)
+        role_cards.append(role_payload)
+
+    _write_roles_index(role_cards, roles_dir / "index.html", job_dir=output)
+
+
+def _copy_analysis_asset(source: Path, target_dir: Path, job_dir: Path) -> str:
+    if not source.exists():
+        return ""
+    target = target_dir / source.name
+    if source.resolve() != target.resolve():
+        shutil.copy2(source, target)
+    return _relative(target, job_dir)
+
+
+def _write_role_contact_sheet(role: dict[str, Any], output: Path, *, job_dir: Path) -> None:
+    images = []
+    for rel in role.get("evidence_paths") or []:
+        src = html.escape(_html_rel(output.parent, job_dir / rel))
+        images.append(f'<img src="{src}" alt="{html.escape(rel)}">')
+    voice_sections = []
+    for voice in role.get("voices") or []:
+        if not isinstance(voice, dict):
+            continue
+        samples = []
+        for rel in voice.get("sample_paths") or []:
+            src = html.escape(_html_rel(output.parent, job_dir / rel))
+            samples.append(f'<audio controls src="{src}"></audio><span>{html.escape(rel)}</span>')
+        transcript = "\n".join(
+            f"{float(item.get('start') or 0):.2f}-{float(item.get('end') or 0):.2f} {item.get('text') or ''}"
+            for item in voice.get("transcript_segments") or []
+            if isinstance(item, dict)
+        )
+        voice_sections.append(
+            "<section>"
+            f"<h2>{html.escape(str(voice.get('name') or voice.get('id') or 'voice'))}</h2>"
+            f"<p>confidence={html.escape(str(voice.get('confidence', '-')))} confirmed={html.escape(str(voice.get('confirmed', False)))}</p>"
+            f"<div>{''.join(samples) or '无声音样本'}</div>"
+            f"<pre>{html.escape(transcript)}</pre>"
+            "</section>"
+        )
+    output.write_text(
+        f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:24px;line-height:1.5}}img{{width:180px;margin:6px}}audio{{display:block;margin:10px 0 2px}}pre{{white-space:pre-wrap;background:#f6f6f6;padding:12px}}</style></head><body>
+<h1>{html.escape(str(role.get('name') or role.get('id') or 'role'))}</h1>
+<p>{html.escape(str(role.get('description') or ''))}</p>
+<p>role_id={html.escape(str(role.get('id') or ''))} confidence={html.escape(str(role.get('confidence', '-')))} confirmed={html.escape(str(role.get('confirmed', False)))}</p>
+<h2>角色证据帧</h2>
+<div>{''.join(images) or '无证据帧'}</div>
+<h2>关联声音</h2>
+{''.join(voice_sections) or '<p>无关联声音样本</p>'}
+<h2>结构化信息</h2>
+<pre>{html.escape(json.dumps(role, ensure_ascii=False, indent=2))}</pre>
+</body></html>""",
+        encoding="utf-8",
+    )
+
+
+def _write_roles_index(roles: list[dict[str, Any]], output: Path, *, job_dir: Path) -> None:
+    rows = []
+    for role in roles:
+        if not isinstance(role, dict):
+            continue
+        images = []
+        for rel in (role.get("evidence_paths") or [])[:4]:
+            images.append(f'<img src="{html.escape(_html_rel(output.parent, job_dir / rel))}" alt="{html.escape(rel)}">')
+        voice_count = sum(len(voice.get("sample_paths") or []) for voice in role.get("voices") or [] if isinstance(voice, dict))
+        link = html.escape(_html_rel(output.parent, job_dir / str(role.get("contact_sheet_path") or "")))
+        rows.append(
+            "<tr>"
+            f'<td><a href="{link}">{html.escape(str(role.get("id") or ""))}</a></td>'
+            f"<td>{html.escape(str(role.get('name') or ''))}</td>"
+            f"<td>{html.escape(str(role.get('confidence', '-')))}</td>"
+            f"<td>{voice_count}</td>"
+            f"<td>{''.join(images)}</td>"
+            "</tr>"
+        )
+    output.write_text(
+        f"""<!doctype html><html lang="zh"><head><meta charset="utf-8"><style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:24px;line-height:1.5}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ddd;padding:8px;vertical-align:top}}img{{width:120px;margin:3px}}</style></head><body>
+<h1>源角色人工检查</h1>
+<p>每个角色有独立文件夹，集中展示源角色证据帧、关联声音样本和对白转写。该目录只用于理解原片和人工检查，不作为目标角色外观。</p>
+<table><thead><tr><th>角色 ID</th><th>名称</th><th>置信度</th><th>声音样本数</th><th>证据帧</th></tr></thead><tbody>{''.join(rows) or '<tr><td colspan="5">暂无角色候选</td></tr>'}</tbody></table>
+</body></html>""",
+        encoding="utf-8",
+    )
+
+
 def _write_entity_contact_sheet(item: dict[str, Any], output: Path, *, job_dir: Path) -> None:
     images = []
     for rel in item.get("evidence_paths") or []:
@@ -643,6 +798,7 @@ def _write_index(payload: dict[str, Any], output: Path, *, job_dir: Path) -> Non
     links = [
         ("剧本", payload.get("script_path")),
         ("剧本复核", payload.get("script_review_path")),
+        ("源角色人工检查", payload.get("roles_index_path")),
     ]
     cards = []
     for title, rel in links:
@@ -1135,6 +1291,7 @@ def _index_entries(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "confidence": item.get("confidence"),
                 "confirmed": item.get("confirmed", False),
                 "profile_path": item.get("profile_path"),
+                "role_review_path": item.get("role_review_path"),
             }
         )
     return result
