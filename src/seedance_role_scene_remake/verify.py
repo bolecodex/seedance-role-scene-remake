@@ -40,13 +40,16 @@ def build_quality_report(
     prep_issues = preparation_issues(manifest)
     for seg in manifest.segments:
         remade = job_dir / seg.remade_path if seg.remade_path else None
-        audio = job_dir / seg.aligned_audio_path if seg.aligned_audio_path else None
+        audio_path_value = seg.aligned_audio_path
+        if not audio_path_value and (not manifest.generate_audio or manifest.audio_mode != "generated"):
+            audio_path_value = seg.source_audio_path
+        audio = job_dir / audio_path_value if audio_path_value else None
         item = {
             "index": seg.index,
             "status": seg.status,
             "duration": seg.duration,
             "remade_path": seg.remade_path,
-            "aligned_audio_path": seg.aligned_audio_path,
+            "aligned_audio_path": audio_path_value,
             "audio": {},
             "continuity": {},
             "identity": {},
@@ -54,7 +57,42 @@ def build_quality_report(
             "language": {},
             "voice": {},
             "target": {},
+            "asset_coverage": {},
+            "reference_report": seg.reference_report,
+            "lipsync": {
+                "dialogue_count": len(seg.dialogue_timings),
+                "timings": seg.dialogue_timings,
+                "issue": False,
+            },
         }
+        reference_report = seg.reference_report or {}
+        ref_assets = reference_report.get("assets", []) if isinstance(reference_report, dict) else []
+        raw_visual_refs = [
+            asset
+            for asset in ref_assets
+            if isinstance(asset, dict)
+            and asset.get("kind") in {"image", "video"}
+            and asset.get("trust_status") != "assetized"
+        ]
+        asset_issue = bool(
+            reference_report.get("reference_privacy") == "assetized"
+            and raw_visual_refs
+            and reference_report.get("strategy") in {"full", "safe", "script-only"}
+        )
+        item["asset_coverage"] = {
+            "issue": asset_issue,
+            "reference_privacy": reference_report.get("reference_privacy"),
+            "raw_visual_slots": [asset.get("slot") for asset in raw_visual_refs],
+            "privacy_rejection": reference_report.get("privacy_rejection"),
+        }
+        if asset_issue:
+            issues.append(
+                {
+                    "segment": seg.index,
+                    "type": "reference_privacy",
+                    "reason": f"raw visual references in assetized mode: {', '.join(item['asset_coverage']['raw_visual_slots'])}",
+                }
+            )
         if identity_report:
             missing = not seg.character_variant_ids
             invalid = [item for item in seg.character_variant_ids if item not in variant_ids]
@@ -129,8 +167,9 @@ def build_quality_report(
                 issues.append({"segment": seg.index, "type": "target", "reason": f"missing target scene reference {scene_id}"})
         if audio_report:
             if not audio or not audio.exists():
-                item["audio"] = {"issue": True, "reason": "missing generated audio"}
-                issues.append({"segment": seg.index, "type": "audio", "reason": "missing generated audio"})
+                reason = "missing generated audio" if manifest.generate_audio and manifest.audio_mode == "generated" else "missing source audio"
+                item["audio"] = {"issue": True, "reason": reason}
+                issues.append({"segment": seg.index, "type": "audio", "reason": reason})
             else:
                 duration = get_video_duration(audio)
                 delta = abs(duration - seg.duration)
@@ -175,6 +214,17 @@ def build_quality_report(
                 scene.id for scene in manifest.scenes if not (scene.image_path or scene.image_uri)
             ],
         },
+        "reference_coverage": [
+            {
+                "segment": seg.index,
+                "strategy": (seg.reference_report or {}).get("strategy"),
+                "counts": (seg.reference_report or {}).get("counts", {}),
+                "assets": (seg.reference_report or {}).get("assets", []),
+                "asset_coverage": next((item["asset_coverage"] for item in segments if item["index"] == seg.index), {}),
+                "dialogue_count": len(seg.dialogue_timings),
+            }
+            for seg in manifest.segments
+        ],
         "dialogue_fidelity": manifest.dialogue_fidelity,
         "audio_mode": manifest.audio_mode,
         "generate_audio": manifest.generate_audio,
@@ -194,6 +244,9 @@ def write_html_report(payload: dict, output: Path) -> Path:
         language = item.get("language") or {}
         voice = item.get("voice") or {}
         target = item.get("target") or {}
+        asset_coverage = item.get("asset_coverage") or {}
+        reference_report = item.get("reference_report") or {}
+        lipsync = item.get("lipsync") or {}
         rows.append(
             "<tr>"
             f"<td>{item['index']:03d}</td>"
@@ -205,6 +258,9 @@ def write_html_report(payload: dict, output: Path) -> Path:
             f"<td>{html.escape(json.dumps(language, ensure_ascii=False))}</td>"
             f"<td>{html.escape(json.dumps(voice, ensure_ascii=False))}</td>"
             f"<td>{html.escape(json.dumps(target, ensure_ascii=False))}</td>"
+            f"<td>{html.escape(json.dumps(asset_coverage, ensure_ascii=False))}</td>"
+            f"<td>{html.escape(json.dumps(reference_report, ensure_ascii=False))}</td>"
+            f"<td>{html.escape(json.dumps(lipsync, ensure_ascii=False))}</td>"
             f"<td>{html.escape(json.dumps(audio, ensure_ascii=False))}</td>"
             "</tr>"
         )
@@ -229,7 +285,7 @@ def write_html_report(payload: dict, output: Path) -> Path:
   <p>preparation: {html.escape(str(payload.get("preparation", {}).get("status")))}</p>
   <p>audio_mode: {html.escape(str(payload["audio_mode"]))}, generate_audio: {payload["generate_audio"]}</p>
   <table>
-    <thead><tr><th>片段</th><th>状态</th><th>生成视频</th><th>对齐音轨</th><th>角色</th><th>场景</th><th>语种</th><th>声音</th><th>目标参考</th><th>音频报告</th></tr></thead>
+    <thead><tr><th>片段</th><th>状态</th><th>生成视频</th><th>对齐音轨</th><th>角色</th><th>场景</th><th>语种</th><th>声音</th><th>目标参考</th><th>资产覆盖</th><th>多参考</th><th>口型时间表</th><th>音频报告</th></tr></thead>
     <tbody>{body}</tbody>
   </table>
 </body>

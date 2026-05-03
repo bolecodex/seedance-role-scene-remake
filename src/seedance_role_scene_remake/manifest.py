@@ -92,6 +92,12 @@ class ReferenceAsset:
     bound_type: str = ""
     bound_id: str = ""
     note: str = ""
+    trust_status: str = "unknown"
+    asset_group_type: str = ""
+    asset_project_name: str = ""
+    asset_status: str = ""
+    assetization_error: str = ""
+    source_uri: str = ""
 
 
 @dataclass
@@ -169,6 +175,7 @@ class SegmentEntry:
     scene_ids: list[str] = field(default_factory=list)
     character_variant_ids: list[str] = field(default_factory=list)
     voice_ids: list[str] = field(default_factory=list)
+    dialogue_timings: list[dict[str, Any]] = field(default_factory=list)
     shot_id: str | None = None
     scene_cluster_id: str | None = None
     continuity_anchor_path: str | None = None
@@ -181,6 +188,7 @@ class SegmentEntry:
     attempts: int = 0
     error: str | None = None
     audio_report: dict[str, Any] = field(default_factory=dict)
+    reference_report: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

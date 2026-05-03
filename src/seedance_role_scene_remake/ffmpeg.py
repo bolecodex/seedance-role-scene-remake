@@ -89,11 +89,19 @@ def duration_for_generation(path: Path) -> int:
 def split_video(video: Path, output_dir: Path, segment_seconds: int) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     duration = get_video_duration(video)
-    paths: list[Path] = []
+    ranges: list[tuple[float, float]] = []
     start = 0.0
-    index = 0
     while start < duration - 0.05:
         chunk_duration = min(float(segment_seconds), duration - start)
+        ranges.append((start, chunk_duration))
+        start += chunk_duration
+    return split_video_ranges(video, output_dir, ranges)
+
+
+def split_video_ranges(video: Path, output_dir: Path, ranges: list[tuple[float, float]]) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, (start, chunk_duration) in enumerate(ranges):
         out = output_dir / f"{index:03d}.mp4"
         run_cmd(
             [
@@ -123,8 +131,6 @@ def split_video(video: Path, output_dir: Path, segment_seconds: int) -> list[Pat
             ]
         )
         paths.append(out)
-        start += chunk_duration
-        index += 1
     return paths
 
 
@@ -199,7 +205,27 @@ def extract_audio(video: Path, output: Path) -> bool:
     if not has_audio(video):
         return False
     output.parent.mkdir(parents=True, exist_ok=True)
-    run_cmd(["ffmpeg", "-y", "-i", str(video), "-vn", "-c:a", "aac", "-b:a", "192k", str(output)])
+    if output.suffix.lower() == ".mp3":
+        run_cmd(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "44100",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "128k",
+                str(output),
+            ]
+        )
+    else:
+        run_cmd(["ffmpeg", "-y", "-i", str(video), "-vn", "-c:a", "aac", "-b:a", "192k", str(output)])
     return True
 
 
@@ -249,6 +275,34 @@ def extract_audio_clip(source: Path, output: Path, *, start: float, duration: fl
         ]
     )
     return True
+
+
+def extract_video_clip(source: Path, output: Path, *, start: float, duration: float) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    run_cmd(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{max(0.0, start):.3f}",
+            "-t",
+            f"{max(0.1, duration):.3f}",
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+    )
 
 
 def detect_scene_timestamps(video: Path, *, threshold: float = 0.35) -> list[float]:

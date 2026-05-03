@@ -49,6 +49,7 @@ class AppConfig:
     tos_endpoint: str = "tos-cn-beijing.volces.com"
     tos_region: str = "cn-beijing"
     tos_presign_expires_s: int = 604800
+    asset_project_name: str = "default"
 
     @property
     def tos_available(self) -> bool:
@@ -125,6 +126,7 @@ def load_config(overrides: dict[str, Any] | None = None) -> AppConfig:
         "tos_endpoint": os.getenv("TOS_ENDPOINT", "tos-cn-beijing.volces.com"),
         "tos_region": os.getenv("TOS_REGION") or os.getenv("OS_REGION", "cn-beijing"),
         "tos_presign_expires_s": _int_env("TOS_PRESIGN_EXPIRES", 604800),
+        "asset_project_name": os.getenv("SEEDANCE_ROLE_SCENE_ASSET_PROJECT_NAME", "default"),
     }
     merged.update({key: value for key, value in overrides.items() if value not in (None, "")})
     return AppConfig(**merged)

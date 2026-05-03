@@ -21,25 +21,32 @@ class AssetsClient:
     VERSION = "2024-01-01"
     HOST = "open.volcengineapi.com"
 
-    def __init__(self, access_key: str, secret_key: str, region: str = "cn-beijing") -> None:
+    def __init__(self, access_key: str, secret_key: str, region: str = "cn-beijing", project_name: str = "default") -> None:
         if not access_key or not secret_key:
             raise ConfigError("资产库 API 需要 VOLC_ACCESSKEY 和 VOLC_SECRETKEY。")
         self.access_key = access_key
         self.secret_key = secret_key
         self.region = region
+        self.project_name = project_name or "default"
 
     def create_asset_group(self, name: str, description: str = "", group_type: str = "AIGC") -> str:
-        response = self._call("CreateAssetGroup", {"Name": name, "Description": description, "GroupType": group_type})
+        response = self._call(
+            "CreateAssetGroup",
+            {"Name": name, "Description": description, "GroupType": group_type, "ProjectName": self.project_name},
+        )
         result = response.get("Result", response)
         return str(result["Id"])
 
     def list_asset_groups(self, group_type: str = "AIGC") -> list[dict[str, Any]]:
-        response = self._call("ListAssetGroups", {"Filter": {"GroupType": group_type}, "PageNumber": 1, "PageSize": 100})
+        response = self._call(
+            "ListAssetGroups",
+            {"Filter": {"GroupType": group_type}, "ProjectName": self.project_name, "PageNumber": 1, "PageSize": 100},
+        )
         result = response.get("Result", response)
         return list(result.get("Items", []))
 
     def create_asset(self, group_id: str, url: str, asset_type: str = "Video", name: str = "") -> str:
-        body: dict[str, Any] = {"GroupId": group_id, "URL": url, "AssetType": asset_type}
+        body: dict[str, Any] = {"GroupId": group_id, "URL": url, "AssetType": asset_type, "ProjectName": self.project_name}
         if name:
             body["Name"] = name
         response = self._call("CreateAsset", body)
@@ -50,8 +57,37 @@ class AssetsClient:
         return str(asset_id)
 
     def get_asset(self, asset_id: str) -> dict[str, Any]:
-        response = self._call("GetAsset", {"Id": asset_id})
+        response = self._call("GetAsset", {"Id": asset_id, "ProjectName": self.project_name})
         return dict(response.get("Result", response))
+
+    def list_assets(
+        self,
+        *,
+        group_ids: list[str] | None = None,
+        group_type: str = "AIGC",
+        statuses: list[str] | None = None,
+        name: str = "",
+    ) -> list[dict[str, Any]]:
+        asset_filter: dict[str, Any] = {"GroupType": group_type}
+        if group_ids:
+            asset_filter["GroupIds"] = group_ids
+        if statuses:
+            asset_filter["Statuses"] = statuses
+        if name:
+            asset_filter["Name"] = name
+        response = self._call(
+            "ListAssets",
+            {
+                "Filter": asset_filter,
+                "ProjectName": self.project_name,
+                "PageNumber": 1,
+                "PageSize": 100,
+                "SortBy": "GroupId",
+                "SortOrder": "Asc",
+            },
+        )
+        result = response.get("Result", response)
+        return list(result.get("Items", []))
 
     def wait_asset_active(self, asset_id: str, *, interval: float = 5, timeout: float = 300) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -112,4 +148,3 @@ class AssetsClient:
     @staticmethod
     def _hmac(data: bytes, key: bytes) -> bytes:
         return hmac.new(key, data, hashlib.sha256).digest()
-

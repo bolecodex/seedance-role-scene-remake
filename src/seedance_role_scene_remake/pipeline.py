@@ -17,6 +17,15 @@ from seedance_role_scene_remake.analysis import (
 )
 from seedance_role_scene_remake.assets import AssetsClient
 from seedance_role_scene_remake.config import AppConfig
+from seedance_role_scene_remake.dialogue import (
+    character_ids_for_range,
+    dialogue_aligned_ranges,
+    read_analysis,
+    scene_ids_for_range,
+    story_beats_from_analysis,
+    timings_for_range,
+    transcript_segments,
+)
 from seedance_role_scene_remake.errors import ManifestError, PipelineError, UploadError
 from seedance_role_scene_remake.ffmpeg import (
     concat_audios,
@@ -28,11 +37,14 @@ from seedance_role_scene_remake.ffmpeg import (
     get_video_fps,
     get_video_ratio,
     image_to_data_url,
+    extract_last_frame,
+    extract_video_clip,
     mux_audio,
     normalize_audio_duration,
     normalize_video_duration,
     parse_ratio,
     split_video,
+    split_video_ranges,
 )
 from seedance_role_scene_remake.manifest import (
     AppearanceVariantSpec,
@@ -51,6 +63,7 @@ from seedance_role_scene_remake.manifest import (
 from seedance_role_scene_remake.preparation import enrich_preparation_draft, preparation_issues
 from seedance_role_scene_remake.preparation import write_contact_sheet
 from seedance_role_scene_remake.prompts import build_generation_prompt
+from seedance_role_scene_remake.reference_composer import ContinuityReferences, ReferenceComposer, build_reference_report
 from seedance_role_scene_remake.seedance import (
     SeedanceClient,
     VideoGenerateRequest,
@@ -137,6 +150,9 @@ def split_job(
     ratio: str = "auto",
     segment_seconds: int = 15,
     no_upload: bool = False,
+    analysis_path: Path | None = None,
+    dialogue_aligned: bool = False,
+    dialogue_max_seconds: float | None = None,
 ) -> Path:
     if not video.exists():
         raise PipelineError(f"输入视频不存在：{video}")
@@ -151,27 +167,48 @@ def split_job(
     spec = _load_spec_or_defaults(spec_path, characters or [], scenes or [], character_prompt, scene_prompt, voice_prompt, prompt)
     source_ratio = get_video_ratio(video)
     target_ratio = parse_ratio(ratio or str(spec.get("ratio", "auto")), source_ratio)
-    segment_paths = split_video(video, output / "segments", segment_seconds)
-    typer.echo(f"已分割 {len(segment_paths)} 个参考片段")
+    analysis_payload: dict[str, Any] | None = read_analysis(analysis_path) if analysis_path else None
+    transcript = transcript_segments(analysis_payload) if analysis_payload else []
+    segment_ranges: list[tuple[float, float]] | None = None
+    if dialogue_aligned and analysis_payload:
+        segment_ranges = dialogue_aligned_ranges(
+            duration=get_video_duration(video),
+            transcript=transcript,
+            max_segment_seconds=dialogue_max_seconds or float(segment_seconds),
+        )
+        segment_paths = split_video_ranges(video, output / "segments", segment_ranges)
+        typer.echo(f"已按 ASR 对白时间轴分割 {len(segment_paths)} 个参考片段")
+    else:
+        segment_paths = split_video(video, output / "segments", segment_seconds)
+        typer.echo(f"已分割 {len(segment_paths)} 个参考片段")
 
     default_segment = (spec.get("segments") or {}).get("default", {}) if isinstance(spec.get("segments"), dict) else {}
     entries: list[SegmentEntry] = []
-    start = 0.0
     for idx, segment in enumerate(segment_paths):
-        duration = get_video_duration(segment)
+        start = segment_ranges[idx][0] if segment_ranges else sum(get_video_duration(path) for path in segment_paths[:idx])
+        duration = segment_ranges[idx][1] if segment_ranges else get_video_duration(segment)
         frame = output / "frames" / f"{idx:03d}.jpg"
-        source_audio = output / "source_audio" / f"{idx:03d}.m4a"
+        source_audio = output / "source_audio" / f"{idx:03d}.mp3"
         extract_first_frame(segment, frame)
         audio_path = _relative(source_audio, output) if extract_audio(segment, source_audio) else None
         per_segment = _segment_spec(spec, idx, default_segment)
         char_ids = list(per_segment.get("characters", []))
         scene_ids = list(per_segment.get("scenes", []))
+        if analysis_payload:
+            inferred_chars = character_ids_for_range(analysis_payload, start=start, end=start + duration)
+            inferred_scenes = scene_ids_for_range(analysis_payload, start=start, end=start + duration)
+            if inferred_chars:
+                char_ids = [item for item in inferred_chars if item in {char.get("id") for char in spec.get("characters", []) if isinstance(char, dict)}] or char_ids
+            if inferred_scenes:
+                scene_ids = [item for item in inferred_scenes if item in {scene.get("id") for scene in spec.get("scenes", []) if isinstance(scene, dict)}] or scene_ids
         variant_ids = list(per_segment.get("character_variants", per_segment.get("variants", [])))
         if not variant_ids:
             variant_ids = [f"{char_id}_default" for char_id in char_ids]
+        variant_ids = _variant_ids_for_characters(spec, char_ids, fallback=variant_ids)
         voice_ids = list(per_segment.get("voices", []))
         if not voice_ids:
             voice_ids = _voice_ids_for_characters(spec, char_ids)
+        dialogue_timings = timings_for_range(transcript, start=start, end=start + duration) if transcript else []
         entries.append(
             SegmentEntry(
                 index=idx,
@@ -187,9 +224,9 @@ def split_job(
                 scene_ids=scene_ids,
                 character_variant_ids=variant_ids,
                 voice_ids=voice_ids,
+                dialogue_timings=dialogue_timings,
             )
         )
-        start += duration
 
     manifest = Manifest(
         source=str(video.resolve()),
@@ -210,8 +247,16 @@ def split_job(
         scenes=_normalize_scenes(spec.get("scenes", []), base=spec_path.parent if spec_path else Path.cwd()),
         segments=entries,
     )
+    if analysis_payload:
+        manifest.story_bible.beats = manifest.story_bible.beats or story_beats_from_analysis(analysis_payload)
+        if not manifest.story_bible.synopsis:
+            manifest.story_bible.synopsis = str(analysis_payload.get("synopsis") or "")
     manifest_path = output / "manifest.json"
     manifest.save(manifest_path)
+    if analysis_path:
+        manifest = Manifest.load(manifest_path)
+        apply_source_analysis_to_manifest(manifest, analysis_path=analysis_path, job_dir=manifest_path.parent)
+        manifest.save(manifest_path)
     typer.echo(f"Manifest 已保存：{manifest_path}")
     if not no_upload:
         upload_job(config=config, manifest_path=manifest_path)
@@ -227,6 +272,8 @@ def prepare_job(
     analysis_path: Path | None = None,
     ratio: str = "auto",
     segment_seconds: int = 15,
+    dialogue_aligned: bool = False,
+    dialogue_max_seconds: float | None = None,
     source_language: str = "auto",
     target_language: str = "preserve_source",
     spoken_language: str = "preserve_source",
@@ -248,6 +295,9 @@ def prepare_job(
         prompt=prompt,
         ratio=ratio,
         segment_seconds=segment_seconds,
+        analysis_path=analysis_path,
+        dialogue_aligned=dialogue_aligned,
+        dialogue_max_seconds=dialogue_max_seconds,
         no_upload=True,
     )
     manifest = Manifest.load(manifest_path)
@@ -475,43 +525,199 @@ def upload_job(*, config: AppConfig, manifest_path: Path, force: bool = False) -
         typer.echo("没有需要上传的素材。")
 
 
-def asset_register_job(*, config: AppConfig, manifest_path: Path, group_name: str, wait: bool = True) -> None:
-    manifest = Manifest.load(manifest_path)
-    client = AssetsClient(config.tos_access_key, config.tos_secret_key, config.tos_region)
-    groups = client.list_asset_groups()
-    group_id = ""
+def _assets_client(config: AppConfig, *, project_name: str | None = None) -> AssetsClient:
+    return AssetsClient(
+        config.tos_access_key,
+        config.tos_secret_key,
+        config.tos_region,
+        project_name=project_name or config.asset_project_name,
+    )
+
+
+def _ensure_asset_group(client: AssetsClient, *, group_name: str, group_type: str) -> str:
+    groups = client.list_asset_groups(group_type=group_type)
     for group in groups:
         if group.get("Name") == group_name:
             group_id = str(group["Id"])
-            typer.echo(f"已有 AssetGroup：{group_id}")
-            break
-    if not group_id:
-        group_id = client.create_asset_group(group_name, description="seedance-role-scene-remake trusted references")
-        typer.echo(f"已创建 AssetGroup：{group_id}")
+            typer.echo(f"已有 {group_type} AssetGroup：{group_id}")
+            return group_id
+    group_id = client.create_asset_group(
+        group_name,
+        description=f"seedance-role-scene-remake {group_type} trusted references",
+        group_type=group_type,
+    )
+    typer.echo(f"已创建 {group_type} AssetGroup：{group_id}")
+    return group_id
 
+
+def _create_asset_uri(
+    client: AssetsClient,
+    *,
+    group_id: str,
+    source: str,
+    asset_type: str,
+    name: str,
+    group_type: str,
+    project_name: str,
+    wait: bool,
+) -> str:
+    asset_id = client.create_asset(group_id, source, asset_type=asset_type, name=name)
+    info: dict[str, Any] = {}
+    if wait:
+        info = client.wait_asset_active(asset_id)
+    status = str(info.get("Status") or ("Active" if wait else "Processing"))
+    if wait and status != "Active":
+        raise PipelineError(f"资产 {asset_id} 不是 Active，当前状态：{status}")
+    typer.echo(f"资产入库：{asset_type} {asset_id} ({group_type}/{project_name}, {status})")
+    return f"asset://{asset_id}"
+
+
+def _asset_id_from_uri(uri: str) -> str:
+    return uri.removeprefix("asset://")
+
+
+def asset_register_job(
+    *,
+    config: AppConfig,
+    manifest_path: Path,
+    group_name: str,
+    group_type: str = "AIGC",
+    project_name: str | None = None,
+    wait: bool = True,
+) -> None:
+    manifest = Manifest.load(manifest_path)
+    job_dir = manifest_path.parent
+    project = project_name or config.asset_project_name
+    client = _assets_client(config, project_name=project)
+    group_id = _ensure_asset_group(client, group_name=group_name, group_type=group_type)
     changed = False
+    for char in manifest.characters:
+        if char.image_uri and not char.image_uri.startswith("asset://"):
+            char.image_uri = _create_asset_uri(
+                client,
+                group_id=group_id,
+                source=char.image_uri,
+                asset_type="Image",
+                name=f"{char.id}-identity",
+                group_type=group_type,
+                project_name=project,
+                wait=wait,
+            )
+            typer.echo(f"[character:{char.id}] OK：{char.image_uri}")
+            changed = True
+        for variant in char.appearance_variants:
+            if variant.image_uri and not variant.image_uri.startswith("asset://"):
+                variant.image_uri = _create_asset_uri(
+                    client,
+                    group_id=group_id,
+                    source=variant.image_uri,
+                    asset_type="Image",
+                    name=f"{char.id}-{variant.id}",
+                    group_type=group_type,
+                    project_name=project,
+                    wait=wait,
+                )
+                typer.echo(f"[variant:{variant.id}] OK：{variant.image_uri}")
+                changed = True
+        if char.voice_reference_uri and not char.voice_reference_uri.startswith("asset://"):
+            char.voice_reference_uri = _create_asset_uri(
+                client,
+                group_id=group_id,
+                source=char.voice_reference_uri,
+                asset_type="Audio",
+                name=f"{char.id}-voice",
+                group_type=group_type,
+                project_name=project,
+                wait=wait,
+            )
+            typer.echo(f"[character:{char.id}:voice] OK：{char.voice_reference_uri}")
+            changed = True
+    for scene in manifest.scenes:
+        if scene.image_uri and not scene.image_uri.startswith("asset://"):
+            scene.image_uri = _create_asset_uri(
+                client,
+                group_id=group_id,
+                source=scene.image_uri,
+                asset_type="Image",
+                name=f"{scene.id}-scene",
+                group_type=group_type,
+                project_name=project,
+                wait=wait,
+            )
+            typer.echo(f"[scene:{scene.id}] OK：{scene.image_uri}")
+            changed = True
+    for voice in manifest.voice_registry:
+        if voice.reference_uri and not voice.reference_uri.startswith("asset://"):
+            voice.reference_uri = _create_asset_uri(
+                client,
+                group_id=group_id,
+                source=voice.reference_uri,
+                asset_type="Audio",
+                name=f"{voice.id}-voice",
+                group_type=group_type,
+                project_name=project,
+                wait=wait,
+            )
+            typer.echo(f"[voice:{voice.id}] OK：{voice.reference_uri}")
+            changed = True
     for seg in manifest.segments:
+        if seg.reference_uri and not seg.reference_uri.startswith("asset://"):
+            seg.reference_uri = _create_asset_uri(
+                client,
+                group_id=group_id,
+                source=seg.reference_uri,
+                asset_type="Video",
+                name=f"{Path(manifest.source).stem}-{seg.index:03d}",
+                group_type=group_type,
+                project_name=project,
+                wait=wait,
+            )
+            if seg.status == "failed":
+                seg.status = "pending"
+                seg.error = None
+            changed = True
+            manifest.save(manifest_path)
+            typer.echo(f"[{seg.index:03d}] OK：{seg.reference_uri}")
+            continue
         if not seg.reference_uri:
-            typer.echo(f"[{seg.index:03d}] 跳过：没有视频参考 URL。")
-            continue
-        if seg.reference_uri.startswith("asset://"):
+            reference = _path_from_manifest(seg.reference_path, job_dir)
+            if reference and reference.exists():
+                tos_cfg = _tos_config(config)
+                source = upload_file(reference, prefix="seedance-role-scene/asset-register/segments", config=tos_cfg)
+                seg.reference_uri = _create_asset_uri(
+                    client,
+                    group_id=group_id,
+                    source=source,
+                    asset_type="Video",
+                    name=f"{Path(manifest.source).stem}-{seg.index:03d}",
+                    group_type=group_type,
+                    project_name=project,
+                    wait=wait,
+                )
+                typer.echo(f"[{seg.index:03d}] OK：{seg.reference_uri}")
+                changed = True
+        elif seg.reference_uri.startswith("asset://"):
             typer.echo(f"[{seg.index:03d}] 已是资产 URI：{seg.reference_uri}")
-            continue
-        asset_id = client.create_asset(group_id, seg.reference_uri, asset_type="Video", name=f"{Path(manifest.source).stem}-{seg.index:03d}")
-        if wait:
-            client.wait_asset_active(asset_id)
-        seg.reference_uri = f"asset://{asset_id}"
-        if seg.status == "failed":
-            seg.status = "pending"
-            seg.error = None
-        changed = True
-        manifest.save(manifest_path)
-        typer.echo(f"[{seg.index:03d}] OK：{seg.reference_uri}")
+        if seg.source_audio_uri and not seg.source_audio_uri.startswith("asset://"):
+            seg.source_audio_uri = _create_asset_uri(
+                client,
+                group_id=group_id,
+                source=seg.source_audio_uri,
+                asset_type="Audio",
+                name=f"{Path(manifest.source).stem}-{seg.index:03d}-audio",
+                group_type=group_type,
+                project_name=project,
+                wait=wait,
+            )
+            typer.echo(f"[{seg.index:03d}:audio] OK：{seg.source_audio_uri}")
+            changed = True
     manifest.repair_history.append(
         {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "action": "asset-register",
             "group_name": group_name,
+            "group_type": group_type,
+            "project_name": project,
             "changed": changed,
         }
     )
@@ -524,6 +730,12 @@ def remake_job(
     manifest_path: Path,
     stop_on_error: bool = False,
     allow_unprepared: bool = False,
+    reference_strategy: str = "full",
+    reference_privacy: str = "assetized",
+    fallback_on_privacy_reject: str = "fail",
+    asset_group_name: str = "seedance-role-scene-remake",
+    asset_group_type: str = "AIGC",
+    asset_project_name: str | None = None,
 ) -> None:
     manifest = Manifest.load(manifest_path)
     job_dir = manifest_path.parent
@@ -535,19 +747,34 @@ def remake_job(
         raise PipelineError(f"准备设定尚未 approved，已停止生成。\n{detail}")
     if allow_unprepared and manifest.requires_preparation_approval():
         typer.echo("警告：正在使用未批准的准备设定生成，角色/场景/语言/声音一致性风险较高。", err=True)
-    if not manifest.generate_audio or manifest.audio_mode != "generated":
-        raise PipelineError("本工具 v1 要求 audio_mode=generated 且 generate_audio=true，不会静默回退原音轨。")
     pending = manifest.pending_segments()
     if not pending:
         typer.echo("没有待处理片段。")
         return
     client = _client(config)
-    typer.echo(f"开始重制 {len(pending)} 个片段：ratio={manifest.target_ratio}, generate_audio={manifest.generate_audio}")
+    typer.echo(
+        f"开始重制 {len(pending)} 个片段：ratio={manifest.target_ratio}, "
+        f"audio_mode={manifest.audio_mode}, generate_audio={manifest.generate_audio}, "
+        f"reference_strategy={reference_strategy}, reference_privacy={reference_privacy}"
+    )
 
     for seg in pending:
         typer.echo(f"\n── 片段 {seg.index:03d} ──")
         try:
-            _remake_segment(client=client, config=config, manifest=manifest, manifest_path=manifest_path, job_dir=job_dir, seg=seg)
+            _remake_segment(
+                client=client,
+                config=config,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                job_dir=job_dir,
+                seg=seg,
+                reference_strategy=reference_strategy,
+                reference_privacy=reference_privacy,
+                fallback_on_privacy_reject=fallback_on_privacy_reject,
+                asset_group_name=asset_group_name,
+                asset_group_type=asset_group_type,
+                asset_project_name=asset_project_name,
+            )
         except Exception as exc:
             seg.status = "failed"
             seg.error = str(exc)
@@ -562,19 +789,26 @@ def extract_audio_job(*, manifest_path: Path, stop_on_error: bool = False) -> No
     manifest = Manifest.load(manifest_path)
     job_dir = manifest_path.parent
     for seg in manifest.succeeded_segments():
-        if not seg.remade_path:
+        if not seg.remade_path and _uses_generated_audio(manifest):
             continue
         try:
-            remade = job_dir / seg.remade_path
-            generated = job_dir / "generated_audio" / f"{seg.index:03d}.m4a"
             aligned = job_dir / "aligned" / f"{seg.index:03d}.m4a"
-            if not extract_audio(remade, generated):
-                raise PipelineError(f"[{seg.index:03d}] 生成视频没有可提取音轨。")
-            normalize_audio_duration(generated, aligned, seg.duration)
-            seg.generated_audio_path = _relative(generated, job_dir)
+            if _uses_generated_audio(manifest):
+                remade = job_dir / str(seg.remade_path)
+                generated = job_dir / "generated_audio" / f"{seg.index:03d}.m4a"
+                if not extract_audio(remade, generated):
+                    raise PipelineError(f"[{seg.index:03d}] 生成视频没有可提取音轨。")
+                normalize_audio_duration(generated, aligned, seg.duration)
+                seg.generated_audio_path = _relative(generated, job_dir)
+                message = "已提取并对齐生成音轨"
+            else:
+                if not seg.source_audio_path:
+                    raise PipelineError(f"[{seg.index:03d}] 缺少源音轨，不能保留原音频。")
+                normalize_audio_duration(job_dir / seg.source_audio_path, aligned, seg.duration)
+                message = "已对齐源音轨"
             seg.aligned_audio_path = _relative(aligned, job_dir)
             seg.audio_report = {"status": "ok", "target_duration": seg.duration}
-            typer.echo(f"[{seg.index:03d}] 已提取并对齐生成音轨：{seg.aligned_audio_path}")
+            typer.echo(f"[{seg.index:03d}] {message}：{seg.aligned_audio_path}")
         except Exception as exc:
             seg.error = str(exc)
             manifest.save(manifest_path)
@@ -602,17 +836,26 @@ def merge_job(*, manifest_path: Path, output: Path | None = None) -> Path:
         aligned_video = aligned_video_dir / f"{seg.index:03d}.mp4"
         normalize_video_duration(remade, aligned_video, seg.duration, fps=source_fps)
         video_paths.append(aligned_video)
+        if not _uses_generated_audio(manifest):
+            continue
         if not seg.aligned_audio_path:
             raise ManifestError(f"[{seg.index:03d}] 缺少生成音轨，请先运行 extract-audio。")
         audio_paths.append(job_dir / seg.aligned_audio_path)
     final = output or (job_dir / "final.mp4")
     silent_video = final.with_name(final.stem + "_video" + final.suffix)
     concat_videos(video_paths, silent_video)
-    generated_audio = final.with_name(final.stem + "_generated_audio.m4a")
-    concat_audios(audio_paths, generated_audio)
-    mux_audio(silent_video, generated_audio, final)
+    if _uses_generated_audio(manifest):
+        generated_audio = final.with_name(final.stem + "_generated_audio.m4a")
+        concat_audios(audio_paths, generated_audio)
+        mux_audio(silent_video, generated_audio, final)
+    else:
+        source_audio = Path(manifest.source)
+        if not source_audio.exists():
+            raise ManifestError(f"源视频不存在，不能直接保留源音轨：{manifest.source}")
+        mux_audio(silent_video, source_audio, final)
     if silent_video.exists():
         silent_video.unlink()
+    manifest.save(manifest_path)
     typer.echo(f"成片已保存：{final}")
     return final
 
@@ -696,6 +939,141 @@ def verify_job(
     return report
 
 
+def _normalize_reference_privacy(value: str) -> str:
+    normalized = value.replace("_", "-").lower().strip() or "assetized"
+    if normalized not in {"raw", "assetized", "script-only"}:
+        raise PipelineError("reference_privacy 只能是 raw、assetized 或 script-only。")
+    return normalized
+
+
+def _normalize_privacy_fallback(value: str) -> str:
+    normalized = value.replace("_", "-").lower().strip() or "fail"
+    if normalized not in {"fail", "script-only"}:
+        raise PipelineError("fallback_on_privacy_reject 只能是 fail 或 script-only。")
+    return normalized
+
+
+def _assetize_reference_assets(
+    assets: list[ReferenceAsset],
+    *,
+    config: AppConfig,
+    group_name: str,
+    group_type: str,
+    project_name: str,
+) -> None:
+    visual_assets = [asset for asset in assets if asset.kind in {"image", "video"} and (asset.uri or asset.path)]
+    if not visual_assets:
+        return
+    client = _assets_client(config, project_name=project_name)
+    group_id = _ensure_asset_group(client, group_name=group_name, group_type=group_type)
+    tos_cfg: TOSConfig | None = None
+    for asset in visual_assets:
+        if asset.uri and asset.uri.startswith("asset://"):
+            _fill_asset_metadata(asset, client=client, group_type=group_type, project_name=project_name)
+            if asset.assetization_error:
+                raise PipelineError(f"{asset.slot} 资产校验失败：{asset.assetization_error}")
+            continue
+        original = asset.uri or asset.path or ""
+        asset.source_uri = original
+        try:
+            source = _asset_source_url(asset, config=config, tos_cfg=tos_cfg)
+            if not source:
+                tos_cfg = _tos_config(config)
+                source = _asset_source_url(asset, config=config, tos_cfg=tos_cfg)
+            asset_id = client.create_asset(
+                group_id,
+                source,
+                asset_type=_asset_type_for_reference(asset),
+                name=f"{asset.bound_type}-{asset.bound_id}-{asset.slot}",
+            )
+            info = client.wait_asset_active(asset_id)
+            asset.uri = f"asset://{asset_id}"
+            asset.trust_status = "assetized"
+            asset.asset_group_type = group_type
+            asset.asset_project_name = project_name
+            asset.asset_status = str(info.get("Status") or "Active")
+            asset.assetization_error = ""
+        except Exception as exc:
+            asset.trust_status = "assetization_failed"
+            asset.asset_group_type = group_type
+            asset.asset_project_name = project_name
+            asset.assetization_error = str(exc)
+            raise PipelineError(f"{asset.slot} 资产化失败：{exc}") from exc
+
+
+def _asset_source_url(asset: ReferenceAsset, *, config: AppConfig, tos_cfg: TOSConfig | None) -> str:
+    if asset.uri and asset.uri.startswith(("http://", "https://")):
+        return asset.uri
+    if asset.path:
+        path = Path(asset.path)
+        if path.exists():
+            if tos_cfg is None:
+                return ""
+            prefix = "seedance-role-scene/assetized-images" if asset.kind == "image" else "seedance-role-scene/assetized-videos"
+            return upload_file(path, prefix=prefix, config=tos_cfg)
+    if asset.uri and asset.uri.startswith("data:"):
+        raise PipelineError("data URL 不能直接入库，请保留本地 path 以便先上传到 TOS。")
+    if asset.uri:
+        return asset.uri
+    raise PipelineError("缺少可入库的 URL 或本地文件。")
+
+
+def _asset_type_for_reference(asset: ReferenceAsset) -> str:
+    if asset.kind == "image":
+        return "Image"
+    if asset.kind == "video":
+        return "Video"
+    if asset.kind == "audio":
+        return "Audio"
+    return asset.kind.title()
+
+
+def _fill_asset_metadata(asset: ReferenceAsset, *, client: AssetsClient, group_type: str, project_name: str) -> None:
+    try:
+        info = client.get_asset(_asset_id_from_uri(asset.uri or ""))
+    except Exception as exc:
+        asset.trust_status = "asset_lookup_failed"
+        asset.assetization_error = str(exc)
+        return
+    asset.trust_status = "assetized"
+    asset.asset_group_type = group_type
+    asset.asset_project_name = str(info.get("ProjectName") or project_name)
+    asset.asset_status = str(info.get("Status") or "")
+    if asset.asset_status and asset.asset_status != "Active":
+        asset.assetization_error = f"资产不是 Active：{asset.asset_status}"
+
+
+def _is_privacy_reject(message: str) -> bool:
+    lower = message.lower()
+    needles = [
+        "sensitivecontentdetected",
+        "privacyinformation",
+        "real person",
+        "input image",
+        "input video",
+        "人像",
+        "真人",
+        "隐私",
+    ]
+    return any(item in lower for item in needles)
+
+
+def _record_privacy_rejection(seg: SegmentEntry, reason: str) -> None:
+    report = seg.reference_report or {}
+    assets = report.get("assets", []) if isinstance(report, dict) else []
+    candidate_slots = [
+        item.get("slot")
+        for item in assets
+        if isinstance(item, dict) and item.get("kind") in {"image", "video"} and item.get("trust_status") != "assetized"
+    ]
+    if not candidate_slots:
+        candidate_slots = [item.get("slot") for item in assets if isinstance(item, dict) and item.get("kind") in {"image", "video"}]
+    report["privacy_rejection"] = {"reason": reason, "candidate_slots": [slot for slot in candidate_slots if slot]}
+    seg.reference_report = report
+    seg.status = "failed"
+    seg.error = reason
+
+
 def repair_job(
     *,
     manifest_path: Path,
@@ -775,6 +1153,9 @@ def run_job(
     no_upload: bool,
     stop_on_error: bool,
     allow_unprepared: bool = False,
+    reference_strategy: str = "full",
+    reference_privacy: str = "assetized",
+    fallback_on_privacy_reject: str = "fail",
 ) -> Path:
     manifest_path = split_job(
         config=config,
@@ -801,8 +1182,19 @@ def run_job(
             detail += f"\n- 另有 {len(issues) - 12} 项问题，运行 review 查看完整列表。"
         raise PipelineError(f"准备设定尚未 approved，已停止上传和生成。\n{detail}")
     upload_job(config=config, manifest_path=manifest_path)
-    remake_job(config=config, manifest_path=manifest_path, stop_on_error=stop_on_error, allow_unprepared=allow_unprepared)
-    extract_audio_job(manifest_path=manifest_path, stop_on_error=stop_on_error)
+    remake_job(
+        config=config,
+        manifest_path=manifest_path,
+        stop_on_error=stop_on_error,
+        allow_unprepared=allow_unprepared,
+        reference_strategy=reference_strategy,
+        reference_privacy=reference_privacy,
+        fallback_on_privacy_reject=fallback_on_privacy_reject,
+    )
+    if _uses_generated_audio(Manifest.load(manifest_path)):
+        extract_audio_job(manifest_path=manifest_path, stop_on_error=stop_on_error)
+    else:
+        typer.echo("audio_mode=source：跳过分段音频拼接，merge 将直接挂载源视频完整音轨。")
     final = merge_job(manifest_path=manifest_path, output=final_output)
     verify_job(
         manifest_path=manifest_path,
@@ -826,6 +1218,12 @@ def _remake_segment(
     manifest_path: Path,
     job_dir: Path,
     seg: SegmentEntry,
+    reference_strategy: str = "full",
+    reference_privacy: str = "assetized",
+    fallback_on_privacy_reject: str = "fail",
+    asset_group_name: str = "seedance-role-scene-remake",
+    asset_group_type: str = "AIGC",
+    asset_project_name: str | None = None,
 ) -> None:
     if seg.task_id:
         status = client.status(seg.task_id)
@@ -844,14 +1242,80 @@ def _remake_segment(
                 max_wait_s=config.poll_max_wait_s,
                 on_update=lambda resp, state: typer.echo(f"轮询：{resp.status} -> {state}"),
             )
-            _handle_polled_result(result.status, result.file_url, result.fail_reason, job_dir, seg, config.request_timeout_s)
+            try:
+                _handle_polled_result(result.status, result.file_url, result.fail_reason, job_dir, seg, config.request_timeout_s)
+            except PipelineError as exc:
+                if _is_privacy_reject(str(exc)) and fallback_on_privacy_reject == "script-only" and reference_strategy != "script-only":
+                    typer.echo(f"隐私审核拒绝，降级 script-only 重试：{exc}", err=True)
+                    seg.task_id = None
+                    seg.status = "pending"
+                    return _remake_segment(
+                        client=client,
+                        config=config,
+                        manifest=manifest,
+                        manifest_path=manifest_path,
+                        job_dir=job_dir,
+                        seg=seg,
+                        reference_strategy="script-only",
+                        reference_privacy="script-only",
+                        fallback_on_privacy_reject="fail",
+                        asset_group_name=asset_group_name,
+                        asset_group_type=asset_group_type,
+                        asset_project_name=asset_project_name,
+                    )
+                raise
             manifest.save(manifest_path)
             return
         seg.task_id = None
 
-    if not seg.reference_uri:
-        raise PipelineError(f"[{seg.index:03d}] 缺少视频参考 URL，请先运行 upload。")
-    reference_assets = _reference_assets(manifest, job_dir, seg)
+    reference_privacy = _normalize_reference_privacy(reference_privacy)
+    fallback_on_privacy_reject = _normalize_privacy_fallback(fallback_on_privacy_reject)
+    effective_strategy = "script-only" if reference_privacy == "script-only" else reference_strategy
+    continuity = _continuity_references(config=config, manifest=manifest, job_dir=job_dir, seg=seg, strategy=effective_strategy)
+    plan = ReferenceComposer(strategy=effective_strategy).compose(
+        manifest=manifest,
+        job_dir=job_dir,
+        segment=seg,
+        continuity=continuity,
+    )
+    reference_assets = plan.assets
+    if reference_privacy == "assetized":
+        try:
+            _assetize_reference_assets(
+                reference_assets,
+                config=config,
+                group_name=asset_group_name,
+                group_type=asset_group_type,
+                project_name=asset_project_name or config.asset_project_name,
+            )
+        except PipelineError as exc:
+            if fallback_on_privacy_reject != "script-only" or effective_strategy == "script-only":
+                seg.reference_report = build_reference_report(
+                    reference_assets,
+                    strategy=effective_strategy,
+                    reference_privacy=reference_privacy,
+                )
+                manifest.save(manifest_path)
+                raise
+            typer.echo(f"隐私资产化失败，降级 script-only：{exc}", err=True)
+            effective_strategy = "script-only"
+            reference_privacy = "script-only"
+            plan = ReferenceComposer(strategy=effective_strategy).compose(
+                manifest=manifest,
+                job_dir=job_dir,
+                segment=seg,
+                continuity=ContinuityReferences(),
+            )
+            reference_assets = plan.assets
+    seg.reference_report = build_reference_report(reference_assets, strategy=effective_strategy, reference_privacy=reference_privacy)
+    typer.echo(
+        f"参考素材：images={seg.reference_report['counts']['image']}/{seg.reference_report['limits']['image']}, "
+        f"videos={seg.reference_report['counts']['video']}/{seg.reference_report['limits']['video']}, "
+        f"audios={seg.reference_report['counts']['audio']}/{seg.reference_report['limits']['audio']}"
+    )
+    usable_assets = [asset for asset in reference_assets if asset.uri or asset.path]
+    if not usable_assets:
+        raise PipelineError(f"[{seg.index:03d}] 缺少可用参考素材，请先运行 upload 或提供目标参考图。")
     req = VideoGenerateRequest(
         model=manifest.model,
         prompt=build_generation_prompt(manifest, seg, reference_assets=reference_assets),
@@ -859,12 +1323,33 @@ def _remake_segment(
         duration=seg.generation_duration,
         resolution=manifest.resolution,
         reference_assets=reference_assets,
-        generate_audio=True,
+        generate_audio=manifest.generate_audio,
     )
     try:
         submitted = client.submit(req)
     except Exception as exc:
         message = str(exc)
+        if _is_privacy_reject(message):
+            _record_privacy_rejection(seg, message)
+            manifest.save(manifest_path)
+            if fallback_on_privacy_reject == "script-only" and effective_strategy != "script-only":
+                typer.echo(f"隐私审核拒绝，降级 script-only 重试：{message}", err=True)
+                seg.task_id = None
+                seg.status = "pending"
+                return _remake_segment(
+                    client=client,
+                    config=config,
+                    manifest=manifest,
+                    manifest_path=manifest_path,
+                    job_dir=job_dir,
+                    seg=seg,
+                    reference_strategy="script-only",
+                    reference_privacy="script-only",
+                    fallback_on_privacy_reject="fail",
+                    asset_group_name=asset_group_name,
+                    asset_group_type=asset_group_type,
+                    asset_project_name=asset_project_name,
+                )
         if "generate_audio" in message or "audio" in message or "音频" in message:
             raise PipelineError(f"Seedance 当前模型或账号不支持生成音频/音频参考：{message}") from exc
         raise
@@ -881,7 +1366,28 @@ def _remake_segment(
         max_wait_s=config.poll_max_wait_s,
         on_update=lambda resp, state: typer.echo(f"轮询：{resp.status} -> {state}"),
     )
-    _handle_polled_result(result.status, result.file_url, result.fail_reason, job_dir, seg, config.request_timeout_s)
+    try:
+        _handle_polled_result(result.status, result.file_url, result.fail_reason, job_dir, seg, config.request_timeout_s)
+    except PipelineError as exc:
+        if _is_privacy_reject(str(exc)) and fallback_on_privacy_reject == "script-only" and effective_strategy != "script-only":
+            typer.echo(f"隐私审核拒绝，降级 script-only 重试：{exc}", err=True)
+            seg.task_id = None
+            seg.status = "pending"
+            return _remake_segment(
+                client=client,
+                config=config,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                job_dir=job_dir,
+                seg=seg,
+                reference_strategy="script-only",
+                reference_privacy="script-only",
+                fallback_on_privacy_reject="fail",
+                asset_group_name=asset_group_name,
+                asset_group_type=asset_group_type,
+                asset_project_name=asset_project_name,
+            )
+        raise
     manifest.save(manifest_path)
 
 
@@ -889,8 +1395,9 @@ def _handle_polled_result(status: str, file_url: str | None, fail_reason: str | 
     normalized = normalize_status(status)
     if normalized != "succeeded" or not file_url:
         reason = fail_reason or status
-        if "real person" in reason.lower() or "human" in reason.lower() or "人像" in reason:
-            reason = f"{reason}。含真人素材时请完成官方授权素材流程后重试，不要规避审核。"
+        if _is_privacy_reject(reason):
+            _record_privacy_rejection(seg, reason)
+            reason = f"{reason}。含真人/拟真人视觉参考时请优先使用 AIGC/LivenessFace 私域资产，不要规避审核。"
         raise PipelineError(f"生成失败：{reason}")
     _save_generated_segment(file_url, job_dir, seg, timeout_s=timeout_s)
 
@@ -903,6 +1410,46 @@ def _save_generated_segment(file_url: str, job_dir: Path, seg: SegmentEntry, *, 
     seg.status = "succeeded"
     seg.error = None
     typer.echo(f"[OK] 已保存：{seg.remade_path}")
+
+
+def _continuity_references(
+    *,
+    config: AppConfig,
+    manifest: Manifest,
+    job_dir: Path,
+    seg: SegmentEntry,
+    strategy: str,
+) -> ContinuityReferences:
+    normalized = strategy.replace("_", "-").lower().strip() or "full"
+    if normalized not in {"full", "safe"}:
+        return ContinuityReferences()
+    previous = next((item for item in manifest.segments if item.index == seg.index - 1 and item.remade_path), None)
+    frame_rel: str | None = None
+    tail_uri: str | None = None
+    if previous and previous.remade_path:
+        previous_video = job_dir / previous.remade_path
+        if previous_video.exists():
+            frame = job_dir / "continuity" / "frames" / f"{previous.index:03d}_tail_for_{seg.index:03d}.jpg"
+            extract_last_frame(previous_video, frame)
+            frame_rel = _relative(frame, job_dir)
+            if normalized == "full":
+                tail = job_dir / "continuity" / "videos" / f"{previous.index:03d}_tail_for_{seg.index:03d}.mp4"
+                duration = get_video_duration(previous_video)
+                extract_video_clip(previous_video, tail, start=max(0.0, duration - 2.0), duration=min(2.0, duration))
+                try:
+                    tail_uri = upload_file(tail, prefix="seedance-role-scene/continuity-video", config=_tos_config(config))
+                except UploadError as exc:
+                    typer.echo(f"警告：上一段尾部视频上传失败，仅使用尾帧连续性参考：{exc}", err=True)
+    context_uri: str | None = None
+    if normalized == "full":
+        next_seg = next((item for item in manifest.segments if item.index == seg.index + 1), None)
+        prev_seg = next((item for item in manifest.segments if item.index == seg.index - 1), None)
+        context_uri = (next_seg.reference_uri if next_seg else None) or (prev_seg.reference_uri if prev_seg else None)
+    return ContinuityReferences(
+        previous_tail_video_uri=tail_uri,
+        previous_tail_frame_path=frame_rel,
+        context_video_uri=context_uri,
+    )
 
 
 def _render_target_image(
@@ -1019,7 +1566,7 @@ def _reference_assets(manifest: Manifest, job_dir: Path, seg: SegmentEntry) -> l
                 image_index += 1
 
     audio_index = 1
-    if seg.source_audio_uri:
+    if _uses_generated_audio(manifest) and seg.source_audio_uri:
         assets.append(
             ReferenceAsset(
                 slot=f"音频{audio_index}",
@@ -1033,22 +1580,27 @@ def _reference_assets(manifest: Manifest, job_dir: Path, seg: SegmentEntry) -> l
         )
         audio_index += 1
     voice_map = manifest.voice_map()
-    for voice_id in seg.voice_ids:
-        voice = voice_map.get(voice_id)
-        if voice and voice.reference_uri:
-            assets.append(
-                ReferenceAsset(
-                    slot=f"音频{audio_index}",
-                    kind="audio",
-                    role="reference_audio",
-                    uri=voice.reference_uri,
-                    bound_type="voice",
-                    bound_id=voice.id,
-                    note=f"{voice.id} 的目标音色参考。",
+    if _uses_generated_audio(manifest):
+        for voice_id in seg.voice_ids:
+            voice = voice_map.get(voice_id)
+            if voice and voice.reference_uri:
+                assets.append(
+                    ReferenceAsset(
+                        slot=f"音频{audio_index}",
+                        kind="audio",
+                        role="reference_audio",
+                        uri=voice.reference_uri,
+                        bound_type="voice",
+                        bound_id=voice.id,
+                        note=f"{voice.id} 的目标音色参考。",
+                    )
                 )
-            )
-            audio_index += 1
+                audio_index += 1
     return assets
+
+
+def _uses_generated_audio(manifest: Manifest) -> bool:
+    return manifest.generate_audio and manifest.audio_mode == "generated"
 
 
 def _image_reference_uri(item: Any, job_dir: Path) -> str | None:
@@ -1152,6 +1704,27 @@ def _voice_ids_for_characters(spec: dict[str, Any], char_ids: list[str]) -> list
         if voice_id and voice_id not in ids:
             ids.append(str(voice_id))
     return ids
+
+
+def _variant_ids_for_characters(spec: dict[str, Any], char_ids: list[str], *, fallback: list[str]) -> list[str]:
+    chars = spec.get("characters", [])
+    if not isinstance(chars, list):
+        return fallback
+    ids: list[str] = []
+    wanted = set(char_ids)
+    for char in chars:
+        if not isinstance(char, dict) or char.get("id") not in wanted:
+            continue
+        variants = char.get("appearance_variants") or []
+        if isinstance(variants, list) and variants:
+            for variant in variants:
+                if isinstance(variant, dict) and variant.get("id") and variant["id"] not in ids:
+                    ids.append(str(variant["id"]))
+        elif char.get("id"):
+            default = f"{char['id']}_default"
+            if default not in ids:
+                ids.append(default)
+    return ids or fallback
 
 
 def _normalize_characters(items: list[dict[str, Any]], *, base: Path) -> list[CharacterSpec]:

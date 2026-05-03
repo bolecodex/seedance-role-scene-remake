@@ -99,6 +99,9 @@ def split(
     prompt: str = typer.Option("", "--prompt", help="全局补充要求。"),
     ratio: str = typer.Option("auto", "--ratio", help="auto、9:16、16:9 等；默认保持源比例。"),
     segment_seconds: int = typer.Option(15, "--segment-seconds", "-s", help="每段最大秒数，范围 1-15。"),
+    analysis: Optional[Path] = typer.Option(None, "--analysis", help="可选 analysis/analysis.json；用于对白对齐分段和自动绑定。"),
+    dialogue_aligned: bool = typer.Option(False, "--dialogue-aligned/--fixed-segments", help="按 ASR 对白时间轴切分，避免切断台词。"),
+    dialogue_max_seconds: float = typer.Option(8.0, "--dialogue-max-seconds", help="对白对齐分段的最大秒数，默认 8。"),
     no_upload: bool = typer.Option(False, "--no-upload", help="只生成本地片段和 manifest，不上传 TOS。"),
 ) -> None:
     """分割视频、抽取帧和原音频，并生成 manifest.json。"""
@@ -115,6 +118,9 @@ def split(
         prompt=prompt,
         ratio=ratio,
         segment_seconds=segment_seconds,
+        analysis_path=analysis,
+        dialogue_aligned=dialogue_aligned,
+        dialogue_max_seconds=dialogue_max_seconds,
         no_upload=no_upload,
     )
 
@@ -166,6 +172,8 @@ def prepare(
     analysis: Optional[Path] = typer.Option(None, "--analysis", help="可选 analysis/analysis.json；将剧本和源素材索引写入 manifest。"),
     ratio: str = typer.Option("auto", "--ratio", help="auto、9:16、16:9 等；默认保持源比例。"),
     segment_seconds: int = typer.Option(15, "--segment-seconds", "-s", help="每段最大秒数，范围 1-15。"),
+    dialogue_aligned: bool = typer.Option(False, "--dialogue-aligned/--fixed-segments", help="按 ASR 对白时间轴切分，避免切断台词。"),
+    dialogue_max_seconds: float = typer.Option(8.0, "--dialogue-max-seconds", help="对白对齐分段的最大秒数，默认 8。"),
     source_language: str = typer.Option("auto", "--source-language", help="源视频语种，默认 auto。"),
     target_language: str = typer.Option("preserve_source", "--target-language", help="目标语种；默认 preserve_source。"),
     spoken_language: str = typer.Option("preserve_source", "--spoken-language", help="角色口语语种；默认 preserve_source，可设 en/zh-CN 等。"),
@@ -185,6 +193,8 @@ def prepare(
         analysis_path=analysis,
         ratio=ratio,
         segment_seconds=segment_seconds,
+        dialogue_aligned=dialogue_aligned,
+        dialogue_max_seconds=dialogue_max_seconds,
         source_language=source_language,
         target_language=target_language,
         spoken_language=spoken_language,
@@ -248,10 +258,19 @@ def asset_register(
     ctx: typer.Context,
     manifest_path: Path = typer.Argument(..., help="manifest.json 路径。"),
     group_name: str = typer.Option("seedance-role-scene-remake", "--group-name", "-g", help="资产组名称。"),
+    group_type: str = typer.Option("AIGC", "--group-type", help="资产组类型：AIGC 或 LivenessFace，默认 AIGC。"),
+    project_name: str = typer.Option("", "--project-name", help="资产所在 ProjectName，默认读取配置。"),
     no_wait: bool = typer.Option(False, "--no-wait", help="注册后不等待资产 Active。"),
 ) -> None:
-    """将 TOS 视频参考注册为私域资产 asset:// URI。"""
-    asset_register_job(config=ctx.obj["config"], manifest_path=manifest_path, group_name=group_name, wait=not no_wait)
+    """将 TOS 视频/图片/音频参考注册为私域资产 asset:// URI；默认使用 AIGC 虚拟素材库。"""
+    asset_register_job(
+        config=ctx.obj["config"],
+        manifest_path=manifest_path,
+        group_name=group_name,
+        group_type=group_type,
+        project_name=project_name or None,
+        wait=not no_wait,
+    )
 
 
 @app.command()
@@ -260,6 +279,12 @@ def remake(
     manifest_path: Path = typer.Argument(..., help="manifest.json 路径。"),
     stop_on_error: bool = typer.Option(False, "--stop-on-error", help="任一片段失败后停止。"),
     allow_unprepared: bool = typer.Option(False, "--allow-unprepared", help="允许使用未批准设定生成；不推荐。"),
+    reference_strategy: str = typer.Option("full", "--reference-strategy", help="参考素材策略：full、safe 或 script-only。"),
+    reference_privacy: str = typer.Option("assetized", "--reference-privacy", help="隐私参考策略：assetized、raw 或 script-only。"),
+    fallback_on_privacy_reject: str = typer.Option("fail", "--fallback-on-privacy-reject", help="隐私审核拒绝后的处理：fail 或 script-only。"),
+    asset_group_name: str = typer.Option("seedance-role-scene-remake", "--asset-group-name", help="自动资产化使用的资产组名称。"),
+    asset_group_type: str = typer.Option("AIGC", "--asset-group-type", help="自动资产化使用的资产组类型：AIGC 或 LivenessFace。"),
+    asset_project_name: str = typer.Option("", "--asset-project-name", help="自动资产化使用的 ProjectName，默认读取配置。"),
 ) -> None:
     """提交或恢复 Seedance 任务，并下载生成片段。"""
     remake_job(
@@ -267,6 +292,12 @@ def remake(
         manifest_path=manifest_path,
         stop_on_error=stop_on_error,
         allow_unprepared=allow_unprepared,
+        reference_strategy=reference_strategy,
+        reference_privacy=reference_privacy,
+        fallback_on_privacy_reject=fallback_on_privacy_reject,
+        asset_group_name=asset_group_name,
+        asset_group_type=asset_group_type,
+        asset_project_name=asset_project_name or None,
     )
 
 
@@ -275,7 +306,7 @@ def extract_audio(
     manifest_path: Path = typer.Argument(..., help="manifest.json 路径。"),
     stop_on_error: bool = typer.Option(False, "--stop-on-error", help="任一片段音频失败后停止。"),
 ) -> None:
-    """从生成视频中提取新音轨，并按原片段时长对齐。"""
+    """提取/对齐分段音轨；audio_mode=source 时通常可跳过，merge 会直接挂载完整源音轨。"""
     extract_audio_job(manifest_path=manifest_path, stop_on_error=stop_on_error)
 
 
@@ -284,7 +315,7 @@ def merge(
     manifest_path: Path = typer.Argument(..., help="manifest.json 路径。"),
     output: Optional[Path] = typer.Option(None, "-o", "--output", help="输出视频路径，默认 job/final.mp4。"),
 ) -> None:
-    """拼接成功片段，并使用生成音轨合成最终视频。"""
+    """拼接成功片段；生成音轨模式拼接分段音频，源音轨模式直接挂载完整源音轨。"""
     merge_job(manifest_path=manifest_path, output=output)
 
 
@@ -361,6 +392,9 @@ def run(
     no_upload: bool = typer.Option(False, "--no-upload", help="保留给 split 兼容；run 不允许跳过上传。"),
     stop_on_error: bool = typer.Option(False, "--stop-on-error", help="任一片段失败后停止。"),
     allow_unprepared: bool = typer.Option(False, "--allow-unprepared", help="允许使用未批准设定生成；不推荐。"),
+    reference_strategy: str = typer.Option("full", "--reference-strategy", help="参考素材策略：full、safe 或 script-only。"),
+    reference_privacy: str = typer.Option("assetized", "--reference-privacy", help="隐私参考策略：assetized、raw 或 script-only。"),
+    fallback_on_privacy_reject: str = typer.Option("fail", "--fallback-on-privacy-reject", help="隐私审核拒绝后的处理：fail 或 script-only。"),
 ) -> None:
     """一键执行：split -> upload -> remake -> extract-audio -> merge -> verify。"""
     if not generated_audio:
@@ -382,6 +416,9 @@ def run(
         no_upload=no_upload,
         stop_on_error=stop_on_error,
         allow_unprepared=allow_unprepared,
+        reference_strategy=reference_strategy,
+        reference_privacy=reference_privacy,
+        fallback_on_privacy_reject=fallback_on_privacy_reject,
     )
 
 

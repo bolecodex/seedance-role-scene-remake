@@ -7,7 +7,7 @@ metadata:
 
 # Seedance 视频换角色换场景
 
-默认工作流是：**原片分析 -> 人工检查源素材 -> 准备目标设定 -> 审阅批准 -> 上传参考 -> Seedance 重制 -> 提取生成音轨 -> 拼接 -> 验证 -> 修复**。
+默认工作流是：**原片分析 -> 人工检查源素材 -> dialogue-aligned 准备目标设定 -> 审阅批准 -> 上传参考 -> Seedance 多参考重制 -> 音频处理 -> 拼接 -> 验证 -> 修复**。
 
 不要一上来生成新视频。先用 `analyze` 把原视频转成剧本，并导出源角色、源场景、道具和角色声音样本，人工检查无误后再进入 `prepare`。源视频/源帧/源声音只用于理解原片和保持剧情、动作、镜头、对白时序，不作为目标人物或目标场景外观。
 
@@ -71,6 +71,8 @@ seedance-role-scene-remake analyze-manifest ./job_remake/analysis/analysis.json
 ```bash
 seedance-role-scene-remake prepare ./input.mp4 -o ./job_remake \
   --analysis ./job_remake/analysis/analysis.json \
+  --dialogue-aligned \
+  --dialogue-max-seconds 8 \
   --segment-seconds 12 \
   --source-language auto \
   --target-language preserve_source \
@@ -96,10 +98,21 @@ seedance-role-scene-remake approve ./job_remake/manifest.json
 
 ```bash
 seedance-role-scene-remake upload ./job_remake/manifest.json
-seedance-role-scene-remake remake ./job_remake/manifest.json
-seedance-role-scene-remake extract-audio ./job_remake/manifest.json
+seedance-role-scene-remake asset-register ./job_remake/manifest.json --group-type AIGC
+seedance-role-scene-remake remake ./job_remake/manifest.json --reference-strategy full --reference-privacy assetized
 seedance-role-scene-remake merge ./job_remake/manifest.json -o ./final.mp4
 ```
+
+`--reference-strategy full` 会按 Seedance 限额编排最多 `9` 张图片、`3` 段视频、`3` 段音频；`safe` 不传任何视频或音频参考，只使用目标图、上一段生成尾帧图片和 ASR 时间表；`script-only` 不传视频、音频或连续性尾帧参考。每段的 `reference_report` 会写入 manifest 和质量报告。
+
+默认使用 `--reference-privacy assetized`：所有可能含真人/拟真人的视觉参考，包括源片段、目标角色图、上一段尾帧和上一段尾部视频，都应先进入私域素材库并以 `asset://` 参与生成。默认 `asset-register --group-type AIGC` 使用私域虚拟素材库，AIGC 素材库也可以上传授权真人素材；`LivenessFace` 是可选路径，不是唯一前提。
+
+源音频参考应由 CLI 导出为 `source_audio/*.mp3` 后上传，避免 r2v 请求因 `.m4a` 音频参考格式被拒。若 `audio_mode=source`，这些 mp3 只用于生成时参考对白节奏，最终音轨仍直接使用完整源视频音轨。
+
+音频策略：
+
+- `audio_mode=generated`：运行 `extract-audio`，从 Seedance 生成片段中抽取音轨并分段对齐，再 `merge`。
+- `audio_mode=source`：通常跳过 `extract-audio`；`merge` 会在拼接生成画面后直接挂载完整源视频音轨，避免把源音频切段重编码造成 AAC 编码延迟累计，引发音画不同步。
 
 ## 质量闭环
 
@@ -116,20 +129,21 @@ seedance-role-scene-remake verify ./job_remake/manifest.json \
 ```bash
 seedance-role-scene-remake repair ./job_remake/manifest.json --from-segment 3 --cascade --reason "identity or scene drift"
 seedance-role-scene-remake remake ./job_remake/manifest.json
-seedance-role-scene-remake extract-audio ./job_remake/manifest.json
 seedance-role-scene-remake merge ./job_remake/manifest.json -o ./final_repair.mp4
 ```
 
 ## Prompt 规则
 
 - 每段请求必须有“参考素材指代表”：`视频1=原片段，仅参考动作/运镜/对白时序；图片1=某角色目标外观；图片N=目标场景；音频1=节奏或音色参考`。
+- 优先走 dialogue-aligned 分段；prompt 中必须写相对时间轴，例如 `0.44-1.00s：c001（图片1）说 "You need to leave."`，并要求无对白角色闭口或聆听。
 - 正文始终用 `角色名（图片N）` 和 `场景名（图片N）` 指代，避免多人串脸或模型误用源视频人物。
 - 多角色必须显式绑定角色和妆造变体；同一角色、同一妆造、同一场景跨片段沿用同一设定。
 - 默认保持源语种；指定目标语种时，全片对白、字幕和屏幕文字都统一翻译。
-- 生成音轨必须来自 Seedance 生成视频；若模型或账号拒绝 `generate_audio` 或音频参考，工具会报错，不静默回退原音轨。
+- 若用户明确要求更换角色声音，生成音轨必须来自 Seedance 生成视频；若模型或账号拒绝 `generate_audio` 或音频参考，工具会报错，不静默伪装为已换音色。
+- 若用户要求“其他保持不变”并保留原语种/原声音，可设置 `audio_mode=source`、`generate_audio=false`；此时只重制画面，最终直接挂载完整源音轨。
 
 详细原片分析目录和 JSON 约定见 `references/source-analysis.md`；详细 manifest 和 prompt 约定见 `references/spec-and-prompts.md`。
 
 ## 合规
 
-真人人像、角色图、音色样本和视频素材必须有授权。遇到真人、人像或音色审核失败时，不要规避审核；应完成官方授权素材流程或接入私域资产能力后再重试。
+真人人像、虚拟真人形象、角色图、音色样本和视频素材必须有授权。遇到真人、人像或音色审核失败时，不要规避审核；优先检查 `reference_report` 是否仍混入 raw TOS URL、data URL、未资产化尾帧或尾部视频。

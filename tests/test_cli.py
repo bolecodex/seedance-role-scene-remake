@@ -219,7 +219,7 @@ def test_render_targets_command_passes_options(tmp_path: Path, monkeypatch):
     assert calls["overwrite"] is True
 
 
-def test_remake_passes_allow_unprepared(tmp_path: Path, monkeypatch):
+def test_remake_passes_reference_privacy_options(tmp_path: Path, monkeypatch):
     calls = {}
 
     def fake_remake_job(**kwargs):
@@ -227,10 +227,54 @@ def test_remake_passes_allow_unprepared(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("seedance_role_scene_remake.cli.remake_job", fake_remake_job)
 
-    result = runner.invoke(app, ["remake", str(tmp_path / "manifest.json"), "--allow-unprepared"])
+    result = runner.invoke(
+        app,
+        [
+            "remake",
+            str(tmp_path / "manifest.json"),
+            "--allow-unprepared",
+            "--reference-privacy",
+            "assetized",
+            "--fallback-on-privacy-reject",
+            "script-only",
+            "--asset-group-type",
+            "AIGC",
+            "--asset-project-name",
+            "default",
+        ],
+    )
 
     assert result.exit_code == 0
     assert calls["allow_unprepared"] is True
+    assert calls["reference_privacy"] == "assetized"
+    assert calls["fallback_on_privacy_reject"] == "script-only"
+    assert calls["asset_group_type"] == "AIGC"
+    assert calls["asset_project_name"] == "default"
+
+
+def test_asset_register_passes_group_type_and_project(tmp_path: Path, monkeypatch):
+    calls = {}
+
+    def fake_asset_register_job(**kwargs):
+        calls.update(kwargs)
+
+    monkeypatch.setattr("seedance_role_scene_remake.cli.asset_register_job", fake_asset_register_job)
+
+    result = runner.invoke(
+        app,
+        [
+            "asset-register",
+            str(tmp_path / "manifest.json"),
+            "--group-type",
+            "AIGC",
+            "--project-name",
+            "default",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls["group_type"] == "AIGC"
+    assert calls["project_name"] == "default"
 
 
 def test_verify_command_passes_audio_options(tmp_path: Path, monkeypatch):

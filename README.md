@@ -9,7 +9,7 @@
 推荐工作流是：
 
 ```text
-analyze -> 人工检查源素材 -> prepare -> review -> approve -> upload -> remake -> extract-audio -> merge -> verify -> repair
+analyze -> 人工检查源素材 -> dialogue-aligned prepare -> review -> approve -> upload -> remake(多参考) -> 音频处理 -> merge -> verify -> repair
 ```
 
 关键原则：
@@ -19,6 +19,7 @@ analyze -> 人工检查源素材 -> prepare -> review -> approve -> upload -> re
 - 未批准的 manifest 默认不能提交 Seedance 生成。
 - 源视频帧只用于理解原片，不作为新角色或新场景外观参考。
 - 目标参考图统一放在 `target_refs/`，并在 prompt 中用 `图片1/图片2/...` 明确指代。
+- 多参考生成默认使用 `--reference-strategy full`，每段最多编排 `9` 张图片、`3` 段视频、`3` 段音频，并在报告里记录实际槽位。
 
 ## 功能
 
@@ -26,8 +27,8 @@ analyze -> 人工检查源素材 -> prepare -> review -> approve -> upload -> re
 - 源素材检查包：导出源角色、源场景、源道具、源声音样本和 HTML 联系表。
 - 角色和妆造归类：自动生成候选角色、候选妆造变体和候选场景簇，供人工复核。
 - 目标参考图生成：缺少角色/场景目标图时，可调用 Seedream 5.0 Lite 生成。
-- Seedance 多参考重制：原片段作为动作/镜头/时序参考，目标角色图和目标场景图作为外观参考。
-- 生成音轨：使用 Seedance 生成视频内置音轨，下载后抽取、对齐并参与最终合成。
+- Seedance 多参考重制：目标角色/场景图锁定外观，源片段或授权私域资产参考动作/运镜/时序，源音频片段参考英文对白节奏。
+- 音频策略：支持 Seedance 生成音轨，也支持“只换画面、保留源音轨”。保留源音轨时，`merge` 直接挂载完整源视频音轨，避免分段重编码造成音画偏移。
 - 可恢复任务：`manifest.json` 记录上传、提交、轮询、下载、修复历史，支持中断后继续。
 - 质量报告：检查角色/场景/语言/声音绑定、目标参考图、音轨时长和片段连续性。
 
@@ -157,6 +158,8 @@ seedance-role-scene-remake analyze-manifest ./job_input_analysis/analysis/analys
 seedance-role-scene-remake prepare ./video/input.mp4 \
   -o ./job_input_remake \
   --analysis ./job_input_analysis/analysis/analysis.json \
+  --dialogue-aligned \
+  --dialogue-max-seconds 8 \
   --segment-seconds 12 \
   --source-language en \
   --target-language preserve_source \
@@ -197,10 +200,36 @@ seedance-role-scene-remake approve ./job_input_remake/manifest.json
 
 ```bash
 seedance-role-scene-remake upload ./job_input_remake/manifest.json
-seedance-role-scene-remake remake ./job_input_remake/manifest.json --stop-on-error
-seedance-role-scene-remake extract-audio ./job_input_remake/manifest.json --stop-on-error
+seedance-role-scene-remake asset-register ./job_input_remake/manifest.json --group-type AIGC
+seedance-role-scene-remake remake ./job_input_remake/manifest.json --reference-strategy full --reference-privacy assetized --stop-on-error
 seedance-role-scene-remake merge ./job_input_remake/manifest.json -o ./final_input_remake.mp4
 ```
+
+`--reference-strategy` 可选：
+
+- `full`：优先使用目标图、源视频、上一段尾部、源音频节奏参考，尽量吃满 Seedance 多参考能力。
+- `safe`：不传任何视频或音频参考；只使用目标图、上一段生成尾帧图片和 ASR 时间表，适合源视频参考触发真人隐私审核时继续生成。
+- `script-only`：只使用目标图和剧本/ASR 时间表，不传源视频或音频参考。
+
+`--reference-privacy` 可选：
+
+- `assetized`：默认值。视频/图片参考必须是 `asset://`，或在提交前自动注册到私域素材库；默认使用 `AIGC` 虚拟素材库，它同样可以承载授权真人素材。
+- `raw`：显式允许直接提交 TOS URL/data URL；若触发隐私审核，CLI 只记录失败，不绕过审核。
+- `script-only`：不传源视频、音频、尾帧或尾部视频，只使用目标图和 ASR 时间轴。
+
+`asset-register --group-type AIGC` 会把已上传的视频、图片、音频参考注册为私域资产。`LivenessFace` 是可选的真人人像库路径，不是使用真人素材的唯一前提；遇到拒审时优先检查 `reference_report` 中是否仍混入 raw TOS/data URL 或尾帧 data URL。
+
+CLI 在 `split/prepare` 时会把每段源音频参考导出为 `source_audio/*.mp3`，用于 Seedance 的音频参考槽；最终成片如果使用 `audio_mode=source`，仍会直接挂载完整原视频音轨。
+
+如果源视频、尾帧、尾部视频、图片或音频参考触发模型/账号能力限制，CLI 会在片段错误中保留具体失败原因和已使用的槽位指代表，不会静默伪装为已使用参考。
+
+如果 manifest 使用 `audio_mode=generated`，在 `merge` 前先运行：
+
+```bash
+seedance-role-scene-remake extract-audio ./job_input_remake/manifest.json --stop-on-error
+```
+
+如果 manifest 使用 `audio_mode=source`，通常不要运行 `extract-audio`；`merge` 会直接使用 `manifest.source` 指向的完整源视频音轨。这样比切段抽取、逐段 AAC 重编码再拼接更不容易产生累计延迟。
 
 也可以使用 `run` 做旧式一键流程，但它仍要求准备阶段已批准，除非显式加 `--allow-unprepared`：
 
@@ -237,7 +266,6 @@ seedance-role-scene-remake repair ./job_input_remake/manifest.json \
   --reason "identity or scene drift"
 
 seedance-role-scene-remake remake ./job_input_remake/manifest.json --stop-on-error
-seedance-role-scene-remake extract-audio ./job_input_remake/manifest.json --stop-on-error
 seedance-role-scene-remake merge ./job_input_remake/manifest.json -o ./final_input_remake_repair.mp4
 ```
 
@@ -311,7 +339,7 @@ ${CODEX_HOME:-$HOME/.codex}/skills/seedance-role-scene-remake
 
 ## 合规
 
-真人人像、角色图、音色样本和视频素材必须有授权。遇到真人、人像或音色审核失败时，不要规避审核；应完成官方授权素材流程或接入私域资产能力后再重试。
+真人人像、虚拟真人形象、角色图、音色样本和视频素材必须有授权。遇到真人、人像或音色审核失败时，不要规避审核；优先把所有视觉参考注册为 AIGC/LivenessFace 私域资产并确认 Active 后再重试。
 
 ## 参考
 
